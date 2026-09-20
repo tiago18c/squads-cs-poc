@@ -1,0 +1,26 @@
+# --- secrets: never commit keypairs ---
+# wallet used by the e2e scripts
+/keys/
+# build output also holds the program deploy keypair (target/deploy/*-keypair.json);
+# regenerate with solana-keygen for your own deployment
+/target/
+*-keypair.json
+*.pem
+
+# --- build & dependency artifacts ---
+/node_modules/
+/.anchor/
+/test-ledger/
+
+# --- local tooling state ---
+/.surfpool/
+/idl_raw.txt
+.DS_Store
+*.log
+
+# --- vendored checkouts & e2e scratch ---
+/vendor/
+/.work-super/
+
+# --- prepared commit message (local convenience, not part of the tree) ---
+/COMMIT_MSG.txt

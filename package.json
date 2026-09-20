@@ -1,0 +1,16 @@
+{
+  "name": "squads-cs-e2e",
+  "private": true,
+  "scripts": {
+    "e2e": "node scripts/e2e.cjs",
+    "e2e:surfpool": "RPC_URL=http://127.0.0.1:8899 node scripts/e2e.cjs",
+    "e2e:devnet": "RPC_URL=https://api.devnet.solana.com node scripts/e2e.cjs"
+  },
+  "dependencies": {
+    "@anchor-lang/core": "^1.2.0",
+    "@solana-program/program-metadata": "^0.9.4",
+    "@solana/kit": "^8.3.0",
+    "@solana/web3.js": "^1.98.0",
+    "@sqds/multisig": "^2.1.3"
+  }
+}

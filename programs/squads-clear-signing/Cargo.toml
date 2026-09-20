@@ -1,0 +1,33 @@
+[package]
+name = "squads-clear-signing"
+version = "0.1.0"
+description = "Clear-signing companion program for Squads Protocol v4 proposal approvals"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "squads_clear_signing"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
+
+[dependencies]
+anchor-lang = "1.2"
+# Instructions sysvar: `load_instruction_at_checked` / `ID` moved out of
+# anchor's `solana_program::sysvar::instructions` re-export in 1.x into this
+# split crate (which anchor itself depends on — pinned to match its version).
+solana-instructions-sysvar = "=3.0.1"
+# SHA-256 for program-buffer hashing via the native `sol_sha256` syscall — the
+# same digest `solana-verify get-buffer-hash` produces (32 bytes / 64 hex), so a
+# reviewer can compare the offline-displayed hash against solana-verify directly.
+# Cheap (a few hundred CU) vs a software SHA-512. Pinned to match anchor's tree.
+solana-sha256-hasher = "=3.1.0"
+
+[dev-dependencies]
+sha2 = "0.10"

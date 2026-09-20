@@ -1,0 +1,452 @@
+{
+  "address": "7xs3LhQjKoCGfXm2qst7LUhismrG1bGxz5Jw6AHij7eu",
+  "metadata": {
+    "name": "squads_clear_signing",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Clear-signing companion program for Squads Protocol v4 proposal approvals"
+  },
+  "instructions": [
+    {
+      "name": "verify_proposal",
+      "docs": [
+        "Verify that the Squads v4 vault transaction stored on-chain matches",
+        "`args.instructions` exactly, and that this transaction contains the",
+        "matching Squads vote instruction (and nothing else). Aborts otherwise."
+      ],
+      "discriminator": [
+        54,
+        140,
+        57,
+        70,
+        243,
+        157,
+        30,
+        124
+      ],
+      "accounts": [
+        {
+          "name": "transaction",
+          "docs": [
+            "The Squads v4 `VaultTransaction` account under vote.",
+            "the handler against the `(multisig, transaction_index)` in the args."
+          ]
+        },
+        {
+          "name": "instructions_sysvar"
+        }
+      ],
+      "args": [
+        {
+          "name": "args",
+          "type": {
+            "defined": {
+              "name": "VerifyProposalArgs"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "verify_buffer_hash",
+      "docs": [
+        "Verify that a BPF upgradeable-loader Buffer account's program bytes",
+        "hash to `args.expected_hash` (SHA-256 via the native `sol_sha256`",
+        "syscall over the bytes with trailing zeros trimmed \u2014 byte-identical to",
+        "`solana-verify get-buffer-hash`).",
+        "Bundle it before `verify_proposal` + the Squads vote when the proposal",
+        "under approval is a program upgrade, so the offline signer sees the",
+        "exact build being deployed, not just the buffer's address. Aborts the",
+        "transaction on any mismatch."
+      ],
+      "discriminator": [
+        69,
+        97,
+        12,
+        142,
+        117,
+        173,
+        124,
+        31
+      ],
+      "accounts": [
+        {
+          "name": "buffer",
+          "docs": [
+            "The BPF upgradeable-loader Buffer account whose contents are checked."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "args",
+          "type": {
+            "defined": {
+              "name": "VerifyBufferHashArgs"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "types": [
+    {
+      "name": "ExpectedAccountMeta",
+      "docs": [
+        "Expected account meta of an inner instruction."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "pubkey",
+            "type": "pubkey"
+          },
+          {
+            "name": "is_signer",
+            "type": "bool"
+          },
+          {
+            "name": "is_writable",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ExpectedInstruction",
+      "docs": [
+        "One expected instruction inside the vault transaction, fully expanded",
+        "(indexes resolved to pubkeys) so an offline device can render it."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "program_id",
+            "docs": [
+              "Program the instruction invokes."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "accounts",
+            "docs": [
+              "Ordered account metas, exactly as compiled into the vault transaction."
+            ],
+            "type": {
+              "vec": {
+                "defined": {
+                  "name": "ExpectedAccountMeta"
+                }
+              }
+            }
+          },
+          {
+            "name": "data",
+            "docs": [
+              "Raw instruction data, byte-for-byte."
+            ],
+            "type": "bytes"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ProposalAction",
+      "docs": [
+        "The kind of Squads v4 vote instruction expected next to `verify_proposal`."
+      ],
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Approve"
+          },
+          {
+            "name": "Reject"
+          },
+          {
+            "name": "Cancel"
+          },
+          {
+            "name": "CancelV2"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VerifyBufferHashArgs",
+      "docs": [
+        "Binds a buffer account to the exact build the offline signer reviewed."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "buffer",
+            "docs": [
+              "The buffer account under verification (must equal the passed account \u2014",
+              "duplicated here so the offline device renders it from the args alone)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "expected_hash",
+            "docs": [
+              "SHA-256 of the buffer's program bytes with trailing zeros trimmed, as a",
+              "**lowercase hex string** (64 chars) \u2014 byte-identical to what",
+              "`solana-verify get-buffer-hash` prints, shown as-is to the signer so it",
+              "can be compared against a locally reproduced build."
+            ],
+            "type": "string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VerifyProposalArgs",
+      "docs": [
+        "Everything the offline signer needs to see, in one IDL-decodable blob."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "multisig",
+            "docs": [
+              "The Squads v4 multisig this proposal belongs to."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "transaction_index",
+            "docs": [
+              "Index of the vault transaction / proposal being voted on."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "vault_index",
+            "docs": [
+              "Vault (authority) index the transaction executes under."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "num_ephemeral_signers",
+            "docs": [
+              "Number of ephemeral signer PDAs the transaction uses (usually 0)."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "member",
+            "docs": [
+              "The multisig member casting the vote \u2014 must be the signer of the",
+              "sibling Squads vote instruction (i.e. the offline device's own key)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "action",
+            "docs": [
+              "Which vote the sibling Squads instruction must be."
+            ],
+            "type": {
+              "defined": {
+                "name": "ProposalAction"
+              }
+            }
+          },
+          {
+            "name": "instructions",
+            "docs": [
+              "The complete, expanded instruction list of the vault transaction.",
+              "Must match the on-chain `VaultTransaction` exactly."
+            ],
+            "type": {
+              "vec": {
+                "defined": {
+                  "name": "ExpectedInstruction"
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "InvalidTransactionOwner",
+      "msg": "Transaction account is not owned by the Squads v4 program"
+    },
+    {
+      "code": 6001,
+      "name": "TransactionPdaMismatch",
+      "msg": "Transaction account does not match the PDA derived from (multisig, transaction_index)"
+    },
+    {
+      "code": 6002,
+      "name": "NotAVaultTransaction",
+      "msg": "Account is not a Squads v4 VaultTransaction (discriminator mismatch)"
+    },
+    {
+      "code": 6003,
+      "name": "TransactionDeserializationError",
+      "msg": "Failed to deserialize the VaultTransaction account data"
+    },
+    {
+      "code": 6004,
+      "name": "MultisigMismatch",
+      "msg": "VaultTransaction.multisig does not match the expected multisig"
+    },
+    {
+      "code": 6005,
+      "name": "TransactionIndexMismatch",
+      "msg": "VaultTransaction.index does not match the expected transaction_index"
+    },
+    {
+      "code": 6006,
+      "name": "VaultIndexMismatch",
+      "msg": "VaultTransaction.vault_index does not match the expected vault_index"
+    },
+    {
+      "code": 6007,
+      "name": "EphemeralSignersMismatch",
+      "msg": "Number of ephemeral signers does not match the expected count"
+    },
+    {
+      "code": 6008,
+      "name": "LookupTableCountMismatch",
+      "msg": "Wrong number of address lookup table accounts supplied as remaining accounts"
+    },
+    {
+      "code": 6009,
+      "name": "LookupTableAddressMismatch",
+      "msg": "Supplied lookup table account does not match the address referenced by the message"
+    },
+    {
+      "code": 6010,
+      "name": "InvalidLookupTableOwner",
+      "msg": "Lookup table account is not owned by the address lookup table program"
+    },
+    {
+      "code": 6011,
+      "name": "InvalidLookupTableData",
+      "msg": "Failed to parse the address lookup table account"
+    },
+    {
+      "code": 6012,
+      "name": "LookupTableIndexOutOfBounds",
+      "msg": "Address lookup table index is out of bounds"
+    },
+    {
+      "code": 6013,
+      "name": "AccountIndexOutOfBounds",
+      "msg": "Message references an account index that is out of bounds"
+    },
+    {
+      "code": 6014,
+      "name": "InstructionCountMismatch",
+      "msg": "Number of instructions in the vault transaction does not match the expected list"
+    },
+    {
+      "code": 6015,
+      "name": "ProgramIdMismatch",
+      "msg": "Instruction program id does not match the expected program id"
+    },
+    {
+      "code": 6016,
+      "name": "AccountCountMismatch",
+      "msg": "Instruction account count does not match the expected accounts"
+    },
+    {
+      "code": 6017,
+      "name": "AccountKeyMismatch",
+      "msg": "Instruction account pubkey does not match the expected account"
+    },
+    {
+      "code": 6018,
+      "name": "AccountWritableMismatch",
+      "msg": "Instruction account writable flag does not match the expected flag"
+    },
+    {
+      "code": 6019,
+      "name": "AccountSignerMismatch",
+      "msg": "Instruction account signer flag does not match the expected flag"
+    },
+    {
+      "code": 6020,
+      "name": "DataMismatch",
+      "msg": "Instruction data does not match the expected data"
+    },
+    {
+      "code": 6021,
+      "name": "InstructionsSysvarError",
+      "msg": "Failed to read the instructions sysvar"
+    },
+    {
+      "code": 6022,
+      "name": "ForbiddenInstruction",
+      "msg": "Transaction contains an instruction to a program that is not allowed alongside a clear-signed vote"
+    },
+    {
+      "code": 6023,
+      "name": "UnexpectedSquadsInstruction",
+      "msg": "Squads instruction in this transaction is not the expected vote instruction"
+    },
+    {
+      "code": 6024,
+      "name": "MalformedVoteInstruction",
+      "msg": "Squads vote instruction has too few accounts"
+    },
+    {
+      "code": 6025,
+      "name": "VoteMultisigMismatch",
+      "msg": "Squads vote instruction targets a different multisig"
+    },
+    {
+      "code": 6026,
+      "name": "VoteProposalMismatch",
+      "msg": "Squads vote instruction targets a different proposal"
+    },
+    {
+      "code": 6027,
+      "name": "VoteMemberMismatch",
+      "msg": "Squads vote instruction member does not match the expected member"
+    },
+    {
+      "code": 6028,
+      "name": "VoteMemberNotSigner",
+      "msg": "Squads vote instruction member is not a transaction signer"
+    },
+    {
+      "code": 6029,
+      "name": "MissingVoteInstruction",
+      "msg": "Transaction does not contain the expected Squads vote instruction"
+    },
+    {
+      "code": 6030,
+      "name": "BufferKeyMismatch",
+      "msg": "Buffer account does not match the address in the args"
+    },
+    {
+      "code": 6031,
+      "name": "InvalidBufferOwner",
+      "msg": "Buffer account is not owned by the BPF upgradeable loader"
+    },
+    {
+      "code": 6032,
+      "name": "NotABuffer",
+      "msg": "Account is not an initialized BPF loader Buffer"
+    },
+    {
+      "code": 6033,
+      "name": "BufferHashMismatch",
+      "msg": "Buffer program bytes do not hash to the expected value"
+    }
+  ]
+}
