@@ -19,9 +19,9 @@
 //! instruction data blob) — all of it structured and decodable offline from
 //! this program's IDL. On-chain, `verify_proposal`:
 //!
-//! 1. re-derives the `VaultTransaction`/`Proposal` PDAs from
-//!    `(multisig, transaction_index)`, binding the vote to exactly one
-//!    transaction;
+//! 1. binds the vote to exactly one transaction: the vote's `Proposal` and the
+//!    `VaultTransaction` must both be Squads-owned, carry the right
+//!    discriminators, and record the same `(multisig, transaction_index)`;
 //! 2. deserializes the stored `VaultTransaction` and diffs it byte-for-byte
 //!    against the expected instructions (resolving address-lookup-table keys
 //!    through the actual table accounts, in Squads' execution order);
@@ -53,35 +53,51 @@ pub mod squads_clear_signing {
     /// `args.instructions` exactly, and that this transaction contains the
     /// matching Squads vote instruction (and nothing else). Aborts otherwise.
     pub fn verify_proposal(ctx: Context<VerifyProposal>, args: VerifyProposalArgs) -> Result<()> {
-        // 1. The transaction account must be the canonical PDA for
-        //    (multisig, transaction_index) and owned by Squads v4.
-        let transaction_pda = squads::derive_transaction_pda(&args.multisig, args.transaction_index);
+        // 1. The proposal under vote. Squads only creates a `Proposal` at the
+        //    PDA `(multisig, transaction_index)` and records those two values in
+        //    it, so a Squads-owned account with the Proposal discriminator tells
+        //    us authoritatively which transaction it belongs to — no PDA
+        //    derivation needed. Step 5 requires the sibling vote to target
+        //    exactly this account.
+        let proposal_key = ctx.accounts.proposal.key();
         require_keys_eq!(
-            ctx.accounts.transaction.key(),
-            transaction_pda,
-            ClearSigningError::TransactionPdaMismatch
+            *ctx.accounts.proposal.owner,
+            squads::SQUADS_PROGRAM_ID,
+            ClearSigningError::InvalidProposalOwner
         );
+        let proposal = {
+            let data = ctx.accounts.proposal.try_borrow_data()?;
+            squads::ProposalHeader::parse_checked(&data)?
+        };
+        require_keys_eq!(
+            proposal.multisig,
+            args.multisig,
+            ClearSigningError::ProposalMultisigMismatch
+        );
+        require_eq!(
+            proposal.transaction_index,
+            args.transaction_index,
+            ClearSigningError::ProposalIndexMismatch
+        );
+
+        // 2. The vault transaction. Same argument: Squads only creates it at the
+        //    PDA `(multisig, index)`, so ownership + discriminator + matching
+        //    stored `(multisig, index)` identify the proposal's transaction.
+        //    The discriminator check also guarantees this is a VaultTransaction,
+        //    not a ConfigTransaction or Batch sharing the index.
         require_keys_eq!(
             *ctx.accounts.transaction.owner,
             squads::SQUADS_PROGRAM_ID,
             ClearSigningError::InvalidTransactionOwner
         );
-
-        // The proposal PDA shares the same seeds plus a suffix, so deriving it
-        // from the same inputs binds proposal <-> transaction <-> multisig.
-        let proposal_pda = squads::derive_proposal_pda(&args.multisig, args.transaction_index);
-
-        // 2. Decode the stored vault transaction. The discriminator check also
-        //    guarantees this is a VaultTransaction, not a ConfigTransaction or
-        //    Batch living at the same seed schema.
         let vault_tx = {
             let data = ctx.accounts.transaction.try_borrow_data()?;
             squads::VaultTransaction::deserialize_checked(&data)?
         };
-        require_keys_eq!(vault_tx.multisig, args.multisig, ClearSigningError::MultisigMismatch);
+        require_keys_eq!(vault_tx.multisig, proposal.multisig, ClearSigningError::MultisigMismatch);
         require_eq!(
             vault_tx.index,
-            args.transaction_index,
+            proposal.transaction_index,
             ClearSigningError::TransactionIndexMismatch
         );
         require_eq!(
@@ -141,7 +157,7 @@ pub mod squads_clear_signing {
             &VoteExpectation {
                 self_program: crate::ID,
                 multisig: args.multisig,
-                proposal: proposal_pda,
+                proposal: proposal_key,
                 member: args.member,
                 action: args.action,
             },
@@ -150,7 +166,7 @@ pub mod squads_clear_signing {
         msg!(
             "clear-signing OK: {:?} on proposal {} (multisig {}, tx index {}, {} instructions) by member {}",
             args.action,
-            proposal_pda,
+            proposal_key,
             args.multisig,
             args.transaction_index,
             vault_tx.message.instructions.len(),
@@ -206,9 +222,14 @@ pub mod squads_clear_signing {
 
 #[derive(Accounts)]
 pub struct VerifyProposal<'info> {
-    /// The Squads v4 `VaultTransaction` account under vote.
-    /// CHECK: owner, PDA derivation, and discriminator are all validated in
-    /// the handler against the `(multisig, transaction_index)` in the args.
+    /// The Squads v4 `Proposal` being voted on (the sibling vote's proposal).
+    /// CHECK: owner, discriminator, and `(multisig, transaction_index)` are
+    /// validated in the handler; the vote must target this exact account.
+    pub proposal: UncheckedAccount<'info>,
+
+    /// The Squads v4 `VaultTransaction` the proposal belongs to.
+    /// CHECK: owner, discriminator, and `(multisig, index)` are validated in
+    /// the handler against the proposal.
     pub transaction: UncheckedAccount<'info>,
 
     /// CHECK: constrained to the instructions sysvar address.

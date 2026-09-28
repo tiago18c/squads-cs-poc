@@ -7,6 +7,7 @@
  *   2. fund vault 0, create a vault transaction: system transfer vault -> wallet
  *   3. create + activate the proposal
  *   4. TAMPERED approval:  [verify_proposal(wrong lamports), proposal_approve] -> must FAIL on-chain
+ *  4b. SUBSTITUTION:       honest #N shown, vote cast on a decoy #N+1 (two variants) -> must FAIL
  *   5. HONEST approval:    [verify_proposal(chain truth),   proposal_approve] -> must succeed
  *   6. execute the vault transaction and confirm the transfer landed
  *
@@ -208,19 +209,23 @@ async function main() {
   const approveIx = multisig.instructions.proposalApprove({
     multisigPda, transactionIndex, member: wallet.publicKey,
   });
-  const verifyArgs = (instructions) => ({
+  const verifyArgs = (instructions, index) => ({
     multisig: multisigPda,
-    transactionIndex: new anchor.BN(transactionIndex.toString()),
+    transactionIndex: new anchor.BN(index.toString()),
     vaultIndex: 0,
     numEphemeralSigners: 0,
     member: wallet.publicKey,
     action: { approve: {} },
     instructions,
   });
-  const makeVerifyIx = (instructions) => program.methods
-    .verifyProposal(verifyArgs(instructions))
-    .accounts({ transaction: transactionPda, instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY })
+  // The overrides let the substitution attacks in step 4b mix accounts.
+  const makeVerifyIx = (instructions, {
+    proposal: p = proposalPda, transaction: t = transactionPda, index = transactionIndex,
+  } = {}) => program.methods
+    .verifyProposal(verifyArgs(instructions, index))
+    .accounts({ proposal: p, transaction: t, instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY })
     .instruction();
+  const errorCode = (name) => IDL.errors.find((e) => e.name === name).code;
   const fetchProposal = () => withRetry(
     () => multisig.accounts.Proposal.fromAccountAddress(connection, proposalPda),
     "fetch Proposal",
@@ -252,6 +257,70 @@ async function main() {
     await sleep(PACE_MS);
   } else {
     ok("proposal already approved — skipping tamper/approve attempts (resume)");
+  }
+
+  // --- 4b. PROPOSAL SUBSTITUTION must fail ----------------------------------
+  // A decoy proposal (next index) that drains the vault. The attacker shows the
+  // signer the honest #N content but gets the vote cast on the decoy.
+  if (proposal.approved.length === 0) {
+    const decoyIndex = transactionIndex + 1n;
+    const [decoyTxPda] = multisig.getTransactionPda({ multisigPda, index: decoyIndex });
+    const [decoyProposalPda] = multisig.getProposalPda({ multisigPda, transactionIndex: decoyIndex });
+    const fetchDecoy = () => withRetry(
+      () => multisig.accounts.Proposal.fromAccountAddress(connection, decoyProposalPda), "fetch decoy Proposal",
+    );
+    if (!(await withRetry(() => connection.getAccountInfo(decoyProposalPda), "getAccountInfo"))) {
+      step(`creating decoy proposal #${decoyIndex}: drain 0.1 SOL vault -> attacker`);
+      const [vaultPda] = multisig.getVaultPda({ multisigPda, index: 0 });
+      const { blockhash } = await withRetry(() => connection.getLatestBlockhash(), "getLatestBlockhash");
+      const decoyMessage = new TransactionMessage({
+        payerKey: vaultPda,
+        recentBlockhash: blockhash,
+        instructions: [SystemProgram.transfer({
+          fromPubkey: vaultPda, toPubkey: Keypair.generate().publicKey, lamports: 0.1 * LAMPORTS_PER_SOL,
+        })],
+      });
+      const made = await sendTx(connection, [
+        multisig.instructions.vaultTransactionCreate({
+          multisigPda, transactionIndex: decoyIndex, creator: wallet.publicKey,
+          vaultIndex: 0, ephemeralSigners: 0, transactionMessage: decoyMessage,
+        }),
+        multisig.instructions.proposalCreate({ multisigPda, transactionIndex: decoyIndex, creator: wallet.publicKey }),
+      ], [wallet]);
+      if (made.err) throw new Error(`decoy create failed: ${JSON.stringify(made.err)}`);
+      await sleep(PACE_MS);
+    }
+    const decoyApproveIx = multisig.instructions.proposalApprove({
+      multisigPda, transactionIndex: decoyIndex, member: wallet.publicKey,
+    });
+    const attacks = [
+      {
+        label: `verify honest #${transactionIndex}, vote on decoy #${decoyIndex}`,
+        ixs: [await makeVerifyIx(expected), decoyApproveIx],
+        expect: "VoteProposalMismatch",
+      },
+      {
+        label: `verify decoy proposal #${decoyIndex} against honest transaction #${transactionIndex}`,
+        ixs: [await makeVerifyIx(expected, { proposal: decoyProposalPda, index: decoyIndex }), decoyApproveIx],
+        expect: "TransactionIndexMismatch",
+      },
+    ];
+    for (const { label, ixs, expect } of attacks) {
+      step(`attack: ${label} — must fail with ${expect}`);
+      const bad = await sendTx(connection, ixs, [wallet], { skipPreflight: true });
+      const code = bad.err?.InstructionError?.[1]?.Custom;
+      if (code !== errorCode(expect)) {
+        throw new Error(`expected ${expect} (${errorCode(expect)}), got ${JSON.stringify(bad.err)}`);
+      }
+      ok(`rejected on-chain with ${expect} (${code}): ${bad.sig}`);
+      await sleep(PACE_MS);
+    }
+    const decoy = await fetchDecoy();
+    proposal = await fetchProposal();
+    if (decoy.approved.length !== 0 || proposal.approved.length !== 0) {
+      throw new Error("a vote was recorded despite the substitution failing!");
+    }
+    ok("no vote recorded on either proposal");
   }
 
   // --- 5. HONEST approval must succeed --------------------------------------

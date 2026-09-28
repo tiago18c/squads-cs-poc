@@ -134,7 +134,7 @@ async function main() {
 
   // verify_proposal: hand-encoded (Anchor's coder overruns its 1000-byte buffer
   // for multi-instruction bundles). Account order matches the Accounts struct:
-  // transaction (ro), instructions_sysvar (ro), then ALT remaining accounts (none).
+  // proposal (ro), transaction (ro), instructions_sysvar (ro), then ALT remaining accounts (none).
   web3Ixs.push(encodeVerifyProposalIx(
     new PublicKey(IDL.address),
     {
@@ -147,6 +147,7 @@ async function main() {
       instructions: expected,
     },
     [
+      { pubkey: proposalPda, isSigner: false, isWritable: false },
       { pubkey: transactionPda, isSigner: false, isWritable: false },
       { pubkey: SYSVAR_INSTRUCTIONS_PUBKEY, isSigner: false, isWritable: false },
     ],

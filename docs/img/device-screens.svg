@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 520" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <style>
+      .cap { font-size: 15px; font-weight: 700; fill: #1b2230; }
+      .cs  { font-size: 12px; fill: #5b6576; }
+      .s   { font-family: JetBrains Mono, Menlo, Consolas, monospace; font-size: 12px; fill: #e6e9ef; }
+      .sd  { font-family: JetBrains Mono, Menlo, Consolas, monospace; font-size: 12px; fill: #8a94a6; }
+      .sh  { font-family: JetBrains Mono, Menlo, Consolas, monospace; font-size: 12.5px; font-weight: 700; fill: #ffffff; }
+      .g   { font-family: JetBrains Mono, Menlo, Consolas, monospace; font-size: 12px; fill: #7ee0a6; }
+      .b   { font-size: 12px; font-weight: 700; fill: #fff; }
+    </style>
+  </defs>
+  <rect width="1040" height="520" fill="#ffffff"/>
+
+  <!-- ===== Device 1: blind ===== -->
+  <g transform="translate(25,20)">
+    <text x="150" y="16" class="cap" text-anchor="middle">① Blind signing</text>
+    <text x="150" y="34" class="cs" text-anchor="middle">nothing decodable</text>
+    <rect x="0" y="50" width="300" height="400" rx="26" fill="#2a2f3a"/>
+    <rect x="18" y="72" width="264" height="300" rx="8" fill="#0f1218"/>
+    <text x="34" y="102" class="sh">Sign transaction?</text>
+    <line x1="34" y1="114" x2="266" y2="114" stroke="#2c3240"/>
+    <text x="34" y="140" class="sd">Message hash</text>
+    <text x="34" y="160" class="s">7Gk2hX…R4pQ9</text>
+    <text x="34" y="190" class="sd">Raw data</text>
+    <text x="34" y="210" class="s">02a1f3 0c77e9 4b10</text>
+    <text x="34" y="228" class="s">9d0e5a 11c4f2 88ab</text>
+    <text x="34" y="246" class="s">…</text>
+    <rect x="34" y="300" width="232" height="52" rx="6" fill="#3b1717"/>
+    <text x="150" y="322" font-size="12" font-weight="700" fill="#ff8a8a" text-anchor="middle">⚠ Unable to decode</text>
+    <text x="150" y="340" font-size="11" fill="#ffb3b3" text-anchor="middle">Blind signing enabled</text>
+    <rect x="30" y="390" width="110" height="36" rx="18" fill="#4a5162"/><text x="85" y="413" class="b" text-anchor="middle">Reject</text>
+    <rect x="160" y="390" width="110" height="36" rx="18" fill="#4a5162"/><text x="215" y="413" class="b" text-anchor="middle">Approve</text>
+  </g>
+
+  <!-- ===== Device 2: clear signing, no context ===== -->
+  <g transform="translate(370,20)">
+    <text x="150" y="16" class="cap" text-anchor="middle">② Clear signing, no context</text>
+    <text x="150" y="34" class="cs" text-anchor="middle">the vote is readable, its target is not</text>
+    <rect x="0" y="50" width="300" height="400" rx="26" fill="#2a2f3a"/>
+    <rect x="18" y="72" width="264" height="300" rx="8" fill="#0f1218"/>
+    <text x="34" y="102" class="sh">Squads v4</text>
+    <text x="34" y="120" class="s">proposal_approve</text>
+    <line x1="34" y1="132" x2="266" y2="132" stroke="#2c3240"/>
+    <text x="34" y="158" class="sd">Multisig</text>
+    <text x="120" y="158" class="s">3Fz…9aK</text>
+    <text x="34" y="180" class="sd">Proposal</text>
+    <text x="120" y="180" class="s">#42</text>
+    <text x="34" y="202" class="sd">Member</text>
+    <text x="120" y="202" class="s">you</text>
+    <text x="34" y="236" class="sd">What does #42 do?</text>
+    <text x="34" y="256" class="s">— not in this tx —</text>
+    <rect x="34" y="300" width="232" height="52" rx="6" fill="#3a2e0d"/>
+    <text x="150" y="322" font-size="12" font-weight="700" fill="#ffd166" text-anchor="middle">⚠ Content lives on-chain</text>
+    <text x="150" y="340" font-size="11" fill="#ffe29a" text-anchor="middle">Device can't verify it</text>
+    <rect x="30" y="390" width="110" height="36" rx="18" fill="#4a5162"/><text x="85" y="413" class="b" text-anchor="middle">Reject</text>
+    <rect x="160" y="390" width="110" height="36" rx="18" fill="#4a5162"/><text x="215" y="413" class="b" text-anchor="middle">Approve</text>
+  </g>
+
+  <!-- ===== Device 3: POC ===== -->
+  <g transform="translate(715,20)">
+    <text x="150" y="16" class="cap" text-anchor="middle">③ Clear signing via this POC</text>
+    <text x="150" y="34" class="cs" text-anchor="middle">full content, enforced on-chain</text>
+    <rect x="-4" y="46" width="308" height="408" rx="29" fill="none" stroke="#2e9e5b" stroke-width="2"/>
+    <rect x="0" y="50" width="300" height="400" rx="26" fill="#2a2f3a"/>
+    <rect x="18" y="72" width="264" height="300" rx="8" fill="#0f1218"/>
+    <text x="34" y="100" class="sd">1/3 verify_buffer_hash</text>
+    <text x="34" y="118" class="s">sha256 7f3c…e1a0</text>
+    <line x1="34" y1="130" x2="266" y2="130" stroke="#2c3240"/>
+    <text x="34" y="150" class="sd">2/3 verify_proposal #42</text>
+    <text x="34" y="170" class="s">↳ BPF Loader: Upgrade</text>
+    <text x="52" y="188" class="s">program Abc…X1</text>
+    <text x="52" y="206" class="s">buffer  Buf…7q</text>
+    <text x="34" y="224" class="s">↳ otter-verify: write</text>
+    <text x="34" y="242" class="s">↳ program-metadata: IDL</text>
+    <line x1="34" y1="254" x2="266" y2="254" stroke="#2c3240"/>
+    <text x="34" y="274" class="sd">3/3 proposal_approve #42</text>
+    <rect x="34" y="300" width="232" height="52" rx="6" fill="#0f3322"/>
+    <text x="150" y="322" font-size="12" font-weight="700" fill="#7ee0a6" text-anchor="middle">✓ Aborts if chain differs</text>
+    <text x="150" y="340" font-size="11" fill="#b6f0cf" text-anchor="middle">decoded from IDL alone</text>
+    <rect x="30" y="390" width="110" height="36" rx="18" fill="#4a5162"/><text x="85" y="413" class="b" text-anchor="middle">Reject</text>
+    <rect x="160" y="390" width="110" height="36" rx="18" fill="#2e9e5b"/><text x="215" y="413" class="b" text-anchor="middle">Approve</text>
+  </g>
+
+  <text x="520" y="500" class="cs" text-anchor="middle">Illustrative screens of an offline signer approving the same upgrade proposal #42.</text>
+</svg>

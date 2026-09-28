@@ -6,7 +6,7 @@
 use std::str::FromStr;
 
 use anchor_lang::prelude::Pubkey;
-use squads_clear_signing::squads::{derive_transaction_pda, VaultTransaction};
+use squads_clear_signing::squads::{VaultTransaction, SQUADS_PROGRAM_ID};
 use squads_clear_signing::validation::{validate_instructions, AccountKeys};
 use squads_clear_signing::{ExpectedAccountMeta, ExpectedInstruction};
 
@@ -18,10 +18,15 @@ fn decodes_real_mainnet_vault_transaction() {
     let tx = VaultTransaction::deserialize_checked(FIXTURE)
         .expect("mirrored layout must decode a real mainnet VaultTransaction");
 
-    // The account's own (multisig, index) must re-derive its address —
-    // this exercises the exact PDA binding the program relies on.
+    // The account's stored (multisig, index) must re-derive its address. The
+    // program no longer derives PDAs itself: it trusts these stored fields on
+    // Squads-owned accounts, which is sound exactly because of this invariant.
     let expected_address = Pubkey::from_str(FIXTURE_ADDRESS.trim()).unwrap();
-    assert_eq!(derive_transaction_pda(&tx.multisig, tx.index), expected_address);
+    let (derived, _) = Pubkey::find_program_address(
+        &[b"multisig", tx.multisig.as_ref(), b"transaction", &tx.index.to_le_bytes()],
+        &SQUADS_PROGRAM_ID,
+    );
+    assert_eq!(derived, expected_address);
 
     // Basic sanity on the decoded message.
     let message = &tx.message;

@@ -172,7 +172,7 @@ async function main() {
       action: { approve: {} },
       instructions: expected,
     })
-    .accounts({ transaction: transactionPda, instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY })
+    .accounts({ proposal: proposalPda, transaction: transactionPda, instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY })
     .instruction());
 
   instructions.push(multisig.instructions.proposalApprove({

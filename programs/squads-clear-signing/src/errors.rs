@@ -4,8 +4,10 @@ use anchor_lang::prelude::*;
 pub enum ClearSigningError {
     #[msg("Transaction account is not owned by the Squads v4 program")]
     InvalidTransactionOwner,
-    #[msg("Transaction account does not match the PDA derived from (multisig, transaction_index)")]
-    TransactionPdaMismatch,
+    // Occupies the slot of the removed `TransactionPdaMismatch` so later codes
+    // (e.g. DataMismatch = 6020, BufferHashMismatch = 6033) stay stable.
+    #[msg("Proposal account is not owned by the Squads v4 program")]
+    InvalidProposalOwner,
     #[msg("Account is not a Squads v4 VaultTransaction (discriminator mismatch)")]
     NotAVaultTransaction,
     #[msg("Failed to deserialize the VaultTransaction account data")]
@@ -70,4 +72,10 @@ pub enum ClearSigningError {
     NotABuffer,
     #[msg("Buffer program bytes do not hash to the expected value")]
     BufferHashMismatch,
+    #[msg("Account is not a Squads v4 Proposal (discriminator mismatch or truncated)")]
+    NotAProposal,
+    #[msg("Proposal.multisig does not match the expected multisig")]
+    ProposalMultisigMismatch,
+    #[msg("Proposal.transaction_index does not match the expected transaction_index")]
+    ProposalIndexMismatch,
 }

@@ -1,7 +1,7 @@
 //! Minimal read-only mirror of the Squads Protocol v4 account layouts.
 //!
 //! Layouts verified against `Squads-Protocol/v4` `programs/squads_multisig_program`
-//! (`state/vault_transaction.rs`, `state/proposal.rs`, `state/seeds.rs`,
+//! (`state/vault_transaction.rs`, `state/proposal.rs`, `instructions/proposal_create.rs`,
 //! `instructions/proposal_vote.rs`, `utils/executable_transaction_message.rs`).
 //! We deliberately do not depend on the `squads-multisig-program` crate to keep
 //! the dependency surface of this security-critical program minimal.
@@ -13,11 +13,6 @@ use crate::errors::ClearSigningError;
 /// Squads Protocol v4 program id (mainnet & devnet deployment).
 pub const SQUADS_PROGRAM_ID: Pubkey = pubkey!("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf");
 
-// PDA seeds (state/seeds.rs).
-pub const SEED_PREFIX: &[u8] = b"multisig";
-pub const SEED_TRANSACTION: &[u8] = b"transaction";
-pub const SEED_PROPOSAL: &[u8] = b"proposal";
-
 /// Anchor account discriminator: sha256("account:VaultTransaction")[..8].
 pub const VAULT_TRANSACTION_DISCRIMINATOR: [u8; 8] = [168, 250, 162, 100, 81, 14, 162, 207];
 
@@ -28,33 +23,31 @@ pub const IX_PROPOSAL_REJECT: [u8; 8] = [243, 62, 134, 156, 230, 106, 246, 135];
 pub const IX_PROPOSAL_CANCEL: [u8; 8] = [27, 42, 127, 237, 38, 163, 84, 203];
 pub const IX_PROPOSAL_CANCEL_V2: [u8; 8] = [205, 41, 194, 61, 220, 139, 16, 247];
 
-/// Derive the `VaultTransaction` PDA for a given multisig and transaction index.
-pub fn derive_transaction_pda(multisig: &Pubkey, transaction_index: u64) -> Pubkey {
-    Pubkey::find_program_address(
-        &[
-            SEED_PREFIX,
-            multisig.as_ref(),
-            SEED_TRANSACTION,
-            &transaction_index.to_le_bytes(),
-        ],
-        &SQUADS_PROGRAM_ID,
-    )
-    .0
+/// Anchor account discriminator: sha256("account:Proposal")[..8].
+pub const PROPOSAL_DISCRIMINATOR: [u8; 8] = [26, 94, 189, 187, 116, 136, 53, 33];
+
+/// The leading fields of `squads_multisig_program::state::Proposal` — all we
+/// need to bind a vote to its transaction. Squads only ever creates a
+/// `Proposal` at the PDA `(multisig, transaction_index)` and writes exactly
+/// those two values here (`proposal_create`), so for a Squads-owned account
+/// with this discriminator they are authoritative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProposalHeader {
+    pub multisig: Pubkey,
+    pub transaction_index: u64,
 }
 
-/// Derive the `Proposal` PDA for a given multisig and transaction index.
-pub fn derive_proposal_pda(multisig: &Pubkey, transaction_index: u64) -> Pubkey {
-    Pubkey::find_program_address(
-        &[
-            SEED_PREFIX,
-            multisig.as_ref(),
-            SEED_TRANSACTION,
-            &transaction_index.to_le_bytes(),
-            SEED_PROPOSAL,
-        ],
-        &SQUADS_PROGRAM_ID,
-    )
-    .0
+impl ProposalHeader {
+    /// Parse `discriminator | multisig (32) | transaction_index (u64 LE)`.
+    pub fn parse_checked(data: &[u8]) -> Result<Self> {
+        require!(
+            data.len() >= 8 + 32 + 8 && data[..8] == PROPOSAL_DISCRIMINATOR,
+            ClearSigningError::NotAProposal
+        );
+        let multisig = Pubkey::try_from(&data[8..40]).unwrap();
+        let transaction_index = u64::from_le_bytes(data[40..48].try_into().unwrap());
+        Ok(Self { multisig, transaction_index })
+    }
 }
 
 /// Mirror of `squads_multisig_program::state::VaultTransaction`.
@@ -185,9 +178,29 @@ mod tests {
     #[test]
     fn rejects_wrong_discriminator() {
         // A Proposal discriminator followed by garbage must be rejected.
-        let mut data = vec![26, 94, 189, 187, 116, 136, 53, 33];
+        let mut data = PROPOSAL_DISCRIMINATOR.to_vec();
         data.extend_from_slice(&[0u8; 128]);
         assert!(VaultTransaction::deserialize_checked(&data).is_err());
+    }
+
+    #[test]
+    fn proposal_header_parse() {
+        let multisig = Pubkey::new_unique();
+        let mut data = PROPOSAL_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(multisig.as_ref());
+        data.extend_from_slice(&42u64.to_le_bytes());
+        // status, bump, vote vecs — ignored by the header parser.
+        data.extend_from_slice(&[0u8; 30]);
+        assert_eq!(
+            ProposalHeader::parse_checked(&data).unwrap(),
+            ProposalHeader { multisig, transaction_index: 42 }
+        );
+
+        // Wrong discriminator (a VaultTransaction) and truncated data both fail.
+        let mut wrong = data.clone();
+        wrong[..8].copy_from_slice(&VAULT_TRANSACTION_DISCRIMINATOR);
+        assert!(ProposalHeader::parse_checked(&wrong).is_err());
+        assert!(ProposalHeader::parse_checked(&data[..47]).is_err());
     }
 
     #[test]
