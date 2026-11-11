@@ -599,9 +599,9 @@ node scripts/e2e-eps.cjs
 | Extra instruction of another program (Memo) in the execution message | `ForbiddenInstruction` (6022) |
 | `verify_proposal` used in place of `verify_proposal_cpi` | `ForbiddenInstruction` (6022) |
 | `verify_proposal_cpi` as a top-level instruction | `NotInvokedViaCpi` (6048) |
-| `[assert_account_hash, verify_proposal_cpi, proposal_approve]` | vote lands, about 127k CU |
+| `[assert_account_hash, assert_program_deploy_slot(signer program), verify_proposal_cpi, proposal_approve]` | vote lands, about 145k CU |
 
-The relayed transaction is 1,730 bytes, so it needs a v1 (4 KB) transaction: the authorization
+The relayed transaction is 1,948 bytes, so it needs a v1 (4 KB) transaction: the authorization
 message repeats every account key inline, which a lookup table cannot shrink.
 
 **Vector** — `scripts/e2e-vector.cjs`, also on a fork of devnet, where Vector is deployed. It
@@ -619,10 +619,10 @@ RPC_URL=http://127.0.0.1:8899 node scripts/e2e-vector.cjs
 | Extra System transfer sub-instruction | `ForbiddenInstruction` (6022) |
 | `verify_proposal_cpi` as a top-level instruction | `NotInvokedViaCpi` (6048) |
 | A second `Passthrough` voting on proposal #2, after or before the verified one | `ForbiddenDriverInstruction` (6055) |
-| `[Advance, Passthrough{assert_account_hash, verify_proposal_cpi, proposal_approve}]`, member = vector account | vote lands, about 49k CU, 847 bytes (legacy transaction) |
+| `[Advance, Passthrough{assert_account_hash, assert_program_deploy_slot(Vector), verify_proposal_cpi, proposal_approve}]`, member = vector account | vote lands, about 57k CU, 933 bytes (legacy transaction) |
 | The same with Compute Budget instructions at top level | vote lands |
 | Member = a vector account's system PDA: vote on the wrong proposal, then the honest vote | `VoteProposalMismatch` (6026), then the vote lands |
-| Two signers in one `Advance` and `Passthrough`, one of them the member, in either order | vote lands, about 63k CU |
+| Two signers in one `Advance` and `Passthrough`, one of them the member, in either order | vote lands, about 71k CU |
 
 Not covered by either script: malformed driver framing, a member that signs the transaction, and
 votes other than approve. The parsers' framing rules are unit-tested with hand-built fixtures.
