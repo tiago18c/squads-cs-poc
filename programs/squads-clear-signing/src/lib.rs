@@ -113,10 +113,13 @@ pub mod squads_clear_signing {
     /// - the **ed25519 programmatic signer**: the top-level instruction is its
     ///   `Submit`, and the list is the execution message handed to the
     ///   message executor;
-    /// - **Vector**: the top-level instruction is a `Passthrough` of the
-    ///   program that owns the member account, with the member as its vector
-    ///   account. No other instruction of that program may appear in the
-    ///   transaction except `Advance`.
+    /// - **Vector**: the top-level instruction is a `Passthrough` of a known
+    ///   Vector program that owns the member account, with the member as its
+    ///   vector account. No other instruction of that program may appear in
+    ///   the transaction except `Advance`.
+    ///
+    /// In both, the member must not be a transaction signer, and this
+    /// instruction must be one the driver invokes directly.
     ///
     /// The list is located by parsing the driver's framing, not from an
     /// argument. It must contain this very invocation and otherwise consist
@@ -125,8 +128,9 @@ pub mod squads_clear_signing {
         ctx: Context<VerifyProposalCpi>,
         args: VerifyProposalArgs,
     ) -> Result<()> {
+        let stack_height = get_stack_height();
         require!(
-            get_stack_height() > TRANSACTION_LEVEL_STACK_HEIGHT,
+            stack_height > TRANSACTION_LEVEL_STACK_HEIGHT,
             ClearSigningError::NotInvokedViaCpi
         );
         require_keys_eq!(
@@ -151,7 +155,8 @@ pub mod squads_clear_signing {
         let driver = sysvar_instructions::load_instruction_at_checked(current, &sysvar_info)
             .map_err(sysvar_error)?;
 
-        // This invocation's own instruction data, to find it in the list.
+        // This invocation's own instruction data, to find it in the list. The
+        // driver's data embeds it, so that length is always enough.
         let mut own_data = Vec::with_capacity(driver.data.len());
         own_data.extend_from_slice(instruction::VerifyProposalCpi::DISCRIMINATOR);
         args.serialize(&mut own_data)?;
@@ -163,14 +168,25 @@ pub mod squads_clear_signing {
             member: args.member,
             action: args.action,
         };
-        if driver.program_id == validation::ED25519_SIGNER_PROGRAM_ID {
-            // Only this Submit's own execution can carry the member's
-            // signature, so the rest of the transaction is not restricted.
+        // The member must be a programmatic signer: listed by the driver
+        // instruction but not signing the transaction. A key that signs the
+        // transaction could also vote from any other top-level instruction.
+        validation::require_programmatic_member(&driver.accounts, &args.member)?;
+
+        // Each driver invokes its listed instructions directly, at a fixed
+        // depth below its own top-level instruction.
+        let expected_height = if driver.program_id == validation::ED25519_SIGNER_PROGRAM_ID {
+            // Submit -> Execute -> listed instruction. Every Submit needs its
+            // own signed authorization, so the rest of the transaction is
+            // not restricted.
             let message = validation::eps_execution_message(&driver.data)?;
             validation::validate_embedded_v1_message(message, &own_data, &expectation)?;
-        } else if driver.program_id == *ctx.accounts.member.owner {
-            // A Vector account is owned by its Vector program, and only that
-            // program can sign for it.
+            TRANSACTION_LEVEL_STACK_HEIGHT + 2
+        } else if validation::VECTOR_PROGRAM_IDS.contains(&driver.program_id)
+            && driver.program_id == *ctx.accounts.member.owner
+        {
+            // Passthrough -> listed instruction. The member is a vector
+            // account of this very Vector program.
             validation::validate_vector_passthrough(
                 &driver.data,
                 &driver.accounts,
@@ -187,10 +203,15 @@ pub mod squads_clear_signing {
                     .map_err(sysvar_error)?;
                 validation::check_vector_sibling(&ix.program_id, &ix.data, &driver.program_id)?;
             }
+            TRANSACTION_LEVEL_STACK_HEIGHT + 1
         } else {
             msg!("unsupported driver program {}", driver.program_id);
             return err!(ClearSigningError::UnsupportedSignerDriver);
-        }
+        };
+        require!(
+            stack_height == expected_height,
+            ClearSigningError::UnexpectedStackHeight
+        );
 
         msg!(
             "clear-signing OK (cpi): {:?} on proposal {} (multisig {}, tx index {}, {} instructions) by member {} via {}",

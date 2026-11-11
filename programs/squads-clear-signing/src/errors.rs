@@ -118,4 +118,8 @@ pub enum ClearSigningError {
     EmbeddedSelfInstructionMissing,
     #[msg("Another instruction of the driver program in this transaction could use the member's signature")]
     ForbiddenDriverInstruction,
+    #[msg("Member signs the transaction itself; verify_proposal_cpi is for programmatic signers only")]
+    MemberIsTransactionSigner,
+    #[msg("verify_proposal_cpi was not invoked directly by the driver")]
+    UnexpectedStackHeight,
 }

@@ -498,6 +498,19 @@ pub const ED25519_SIGNER_PROGRAM_ID: Pubkey =
 pub const MESSAGE_EXECUTOR_PROGRAM_ID: Pubkey =
     pubkey!("ExecxgyHYsAXB4c5dZodV1zJZ9hqfsDCYkRDRATrpkFR");
 
+/// The Vector programs, one per signature scheme (ed25519, secp256k1,
+/// EIP-191, Falcon-512, ML-DSA-44, Winternitz, XMSS). They share one wire
+/// layout.
+pub const VECTOR_PROGRAM_IDS: [Pubkey; 7] = [
+    pubkey!("vectorcLBXJ2TuoKuUygkEi6FWqvBnbHDEDWoYamfjV"),
+    pubkey!("9NCknbW4LpePSZzbZGFk2HHsSH4y4pkmRjEguJo7qqjd"),
+    pubkey!("G6okL1MvXx7k5eytY7wRXNupXyYG1QVZW37ygAjMiTTu"),
+    pubkey!("HdkE3dPYgCRZJgLv64mbFmojyCprUim8VRXzK2wR6Qgm"),
+    pubkey!("5qR1iCC5hinGAR9iE8dp5xJyh3Wq1Cwsxa4BuBuJieMr"),
+    pubkey!("GvCGfvMTr8YZJZkV9KxaGF1Y2EzxUksur8iDwjVwJwGf"),
+    pubkey!("7qCyy3NJQDMctSDiM4DxNjNR6TyasouyyRTBREhcXdsE"),
+];
+
 /// ed25519 signer `Submit` / message executor `Execute` discriminators.
 const SUBMIT_DISCRIMINATOR: u8 = 0;
 const EXECUTE_DISCRIMINATOR: u8 = 0;
@@ -550,6 +563,24 @@ impl<'a> V1Prelude<'a> {
         let bytes = self.addresses.get(start..start + 32)?;
         Some(Pubkey::new_from_array(bytes.try_into().unwrap()))
     }
+}
+
+/// The member of a `verify_proposal_cpi` must be a programmatic signer: the
+/// driver's top-level instruction lists it (both drivers pass every account
+/// they forward), and it does not sign the transaction. An ordinary keypair
+/// that signs the transaction would pass the driver's signer forwarding, yet
+/// could also vote from any other top-level instruction.
+pub fn require_programmatic_member(
+    driver_accounts: &[anchor_lang::solana_program::instruction::AccountMeta],
+    member: &Pubkey,
+) -> Result<()> {
+    let mut listed = false;
+    for meta in driver_accounts.iter().filter(|m| m.pubkey == *member) {
+        require!(!meta.is_signer, ClearSigningError::MemberIsTransactionSigner);
+        listed = true;
+    }
+    require!(listed, ClearSigningError::MalformedDriverInstruction);
+    Ok(())
 }
 
 /// Parse the data of an ed25519 signer `Submit` instruction and return the
@@ -1603,6 +1634,76 @@ mod tests {
     }
 
     #[test]
+    fn member_must_be_listed_and_not_a_transaction_signer() {
+        let metas = [
+            AccountMeta::new(pk(1), true), // fee payer
+            AccountMeta::new(pk(103), false),
+            AccountMeta::new_readonly(pk(9), false),
+        ];
+        require_programmatic_member(&metas, &pk(103)).unwrap();
+        assert_eq!(
+            code(require_programmatic_member(&metas, &pk(1))),
+            err_code(ClearSigningError::MemberIsTransactionSigner)
+        );
+        assert_eq!(
+            code(require_programmatic_member(&metas, &pk(66))),
+            err_code(ClearSigningError::MalformedDriverInstruction)
+        );
+    }
+
+    #[test]
+    fn v1_edge_cases() {
+        let signers = [pk(103)];
+        let exp = expectation();
+        let malformed = err_code(ClearSigningError::MalformedEmbeddedInstructions);
+        // No instructions at all: nothing to find.
+        assert_eq!(
+            code(v1(&signers, &[])),
+            err_code(ClearSigningError::EmbeddedSelfInstructionMissing)
+        );
+        // Legacy / v0 prefixes are not v1 messages.
+        let message = v1_message(&signers, &[embedded_self(), embedded_vote(pk(102))]);
+        for prefix in [0x80u8, 0x01] {
+            let mut other = message.clone();
+            other[0] = prefix;
+            assert_eq!(code(validate_embedded_v1_message(&other, OWN, &exp)), malformed);
+        }
+        // Program index beyond the key table (first header byte).
+        let mut bad_program = message.clone();
+        let header = 42 + 32 * usize::from(message[41]);
+        bad_program[header] = 200;
+        assert_eq!(code(validate_embedded_v1_message(&bad_program, OWN, &exp)), malformed);
+        // The same data under another program is not this invocation.
+        let impostor = (pk(200), vec![], OWN.to_vec());
+        assert_eq!(
+            code(v1(&signers, &[impostor, embedded_vote(pk(102))])),
+            err_code(ClearSigningError::ForbiddenInstruction)
+        );
+        // Our data followed by an extra byte is a different invocation.
+        let padded = (pk(100), vec![], [OWN, &[0]].concat());
+        assert_eq!(
+            code(v1(&signers, &[padded, embedded_vote(pk(102))])),
+            err_code(ClearSigningError::EmbeddedSelfInstructionMissing)
+        );
+    }
+
+    #[test]
+    fn passthrough_edge_cases() {
+        // Empty list.
+        assert_eq!(
+            code(pt(&[])),
+            err_code(ClearSigningError::EmbeddedSelfInstructionMissing)
+        );
+        // A Squads vote with too few accounts.
+        let mut short_vote = embedded_vote(pk(102));
+        short_vote.1.pop();
+        assert_eq!(
+            code(pt(&[embedded_self(), short_vote])),
+            err_code(ClearSigningError::MalformedVoteInstruction)
+        );
+    }
+
+    #[test]
     fn vector_siblings_must_be_advances() {
         let vector = pk(150);
         check_vector_sibling(&vector, &[1, 0xAA], &vector).unwrap();
@@ -1621,5 +1722,6 @@ mod tests {
         assert_eq!(err_code(ClearSigningError::ProgramHashMismatch), 6047);
         assert_eq!(err_code(ClearSigningError::NotInvokedViaCpi), 6048);
         assert_eq!(err_code(ClearSigningError::ForbiddenDriverInstruction), 6055);
+        assert_eq!(err_code(ClearSigningError::UnexpectedStackHeight), 6057);
     }
 }

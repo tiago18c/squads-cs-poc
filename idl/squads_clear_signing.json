@@ -210,10 +210,13 @@
         "- the **ed25519 programmatic signer**: the top-level instruction is its",
         "`Submit`, and the list is the execution message handed to the",
         "message executor;",
-        "- **Vector**: the top-level instruction is a `Passthrough` of the",
-        "program that owns the member account, with the member as its vector",
-        "account. No other instruction of that program may appear in the",
-        "transaction except `Advance`.",
+        "- **Vector**: the top-level instruction is a `Passthrough` of a known",
+        "Vector program that owns the member account, with the member as its",
+        "vector account. No other instruction of that program may appear in",
+        "the transaction except `Advance`.",
+        "",
+        "In both, the member must not be a transaction signer, and this",
+        "instruction must be one the driver invokes directly.",
         "",
         "The list is located by parsing the driver's framing, not from an",
         "argument. It must contain this very invocation and otherwise consist",
@@ -800,6 +803,16 @@
       "code": 6055,
       "name": "ForbiddenDriverInstruction",
       "msg": "Another instruction of the driver program in this transaction could use the member's signature"
+    },
+    {
+      "code": 6056,
+      "name": "MemberIsTransactionSigner",
+      "msg": "Member signs the transaction itself; verify_proposal_cpi is for programmatic signers only"
+    },
+    {
+      "code": 6057,
+      "name": "UnexpectedStackHeight",
+      "msg": "verify_proposal_cpi was not invoked directly by the driver"
     }
   ]
 }
