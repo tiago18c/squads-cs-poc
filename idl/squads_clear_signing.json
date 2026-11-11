@@ -198,16 +198,26 @@
       "name": "verify_proposal_cpi",
       "docs": [
         "`verify_proposal` for a **programmatic signer**: a member key that is a",
-        "PDA and can only sign inside a CPI (ed25519 programmatic signer,",
-        "Vector, ...). Must itself be invoked via CPI, with the member signing.",
+        "PDA and can only sign inside a CPI. Must itself be invoked via CPI,",
+        "with the member signing.",
         "",
         "The content checks are identical to `verify_proposal`. The difference",
         "is where the Squads vote is looked for: not among the top-level",
-        "instructions, but in the instruction list serialized inside the data",
-        "of the current top-level instruction (the one driving the signer",
-        "program), at the place `location` gives. That list must run to the end",
-        "of the instruction data, contain this very invocation, and otherwise",
-        "consist only of this program's instructions and the expected vote."
+        "instructions, but in the instruction list that the signer program (the",
+        "\"driver\") executes, parsed from the top-level instruction this CPI",
+        "descends from. Two drivers are recognised:",
+        "",
+        "- the **ed25519 programmatic signer**: the top-level instruction is its",
+        "`Submit`, and the list is the execution message handed to the",
+        "message executor;",
+        "- **Vector**: the top-level instruction is a `Passthrough` of the",
+        "program that owns the member account, with the member as its vector",
+        "account. No other instruction of that program may appear in the",
+        "transaction except `Advance`.",
+        "",
+        "The list is located by parsing the driver's framing, not from an",
+        "argument. It must contain this very invocation and otherwise consist",
+        "only of this program's instructions and the expected vote."
       ],
       "discriminator": [
         220,
@@ -240,7 +250,8 @@
           "name": "member",
           "docs": [
             "The multisig member casting the vote: the programmatic signer, which",
-            "must sign this CPI (and equal `args.member`)."
+            "must sign this CPI (and equal `args.member`). For Vector, this is the",
+            "vector account, owned by its Vector program."
           ],
           "signer": true
         }
@@ -251,14 +262,6 @@
           "type": {
             "defined": {
               "name": "VerifyProposalArgs"
-            }
-          }
-        },
-        {
-          "name": "location",
-          "type": {
-            "defined": {
-              "name": "VoteLocation"
             }
           }
         }
@@ -512,40 +515,6 @@
               "`solana-verify get-program-hash <program>`."
             ],
             "type": "string"
-          }
-        ]
-      }
-    },
-    {
-      "name": "VoteLocation",
-      "docs": [
-        "Where `verify_proposal_cpi` finds the instruction list that carries the",
-        "Squads vote, inside the data of the current top-level instruction."
-      ],
-      "type": {
-        "kind": "enum",
-        "variants": [
-          {
-            "name": "V1Message",
-            "fields": [
-              {
-                "name": "offset",
-                "type": "u16"
-              }
-            ]
-          },
-          {
-            "name": "Passthrough",
-            "fields": [
-              {
-                "name": "offset",
-                "type": "u16"
-              },
-              {
-                "name": "first_account",
-                "type": "u8"
-              }
-            ]
           }
         ]
       }
@@ -804,18 +773,33 @@
     },
     {
       "code": 6050,
-      "name": "MalformedEmbeddedInstructions",
-      "msg": "Embedded instructions at the given offset are malformed or out of bounds"
+      "name": "UnsupportedSignerDriver",
+      "msg": "The top-level instruction is not a supported programmatic-signer driver for this member"
     },
     {
       "code": 6051,
-      "name": "EmbeddedTrailingBytes",
-      "msg": "Embedded instructions do not end exactly at the end of the enclosing instruction"
+      "name": "MalformedDriverInstruction",
+      "msg": "The driver's top-level instruction does not have the expected layout"
     },
     {
       "code": 6052,
+      "name": "MalformedEmbeddedInstructions",
+      "msg": "The driver's embedded instruction list is malformed or out of bounds"
+    },
+    {
+      "code": 6053,
+      "name": "EmbeddedTrailingBytes",
+      "msg": "The driver's embedded instruction list has trailing bytes or accounts"
+    },
+    {
+      "code": 6054,
       "name": "EmbeddedSelfInstructionMissing",
-      "msg": "Embedded instructions do not contain this verify_proposal_cpi instruction"
+      "msg": "The driver's embedded instruction list does not contain this verify_proposal_cpi instruction"
+    },
+    {
+      "code": 6055,
+      "name": "ForbiddenDriverInstruction",
+      "msg": "Another instruction of the driver program in this transaction could use the member's signature"
     }
   ]
 }

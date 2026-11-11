@@ -101,20 +101,29 @@ pub mod squads_clear_signing {
     }
 
     /// `verify_proposal` for a **programmatic signer**: a member key that is a
-    /// PDA and can only sign inside a CPI (ed25519 programmatic signer,
-    /// Vector, ...). Must itself be invoked via CPI, with the member signing.
+    /// PDA and can only sign inside a CPI. Must itself be invoked via CPI,
+    /// with the member signing.
     ///
     /// The content checks are identical to `verify_proposal`. The difference
     /// is where the Squads vote is looked for: not among the top-level
-    /// instructions, but in the instruction list serialized inside the data
-    /// of the current top-level instruction (the one driving the signer
-    /// program), at the place `location` gives. That list must run to the end
-    /// of the instruction data, contain this very invocation, and otherwise
-    /// consist only of this program's instructions and the expected vote.
+    /// instructions, but in the instruction list that the signer program (the
+    /// "driver") executes, parsed from the top-level instruction this CPI
+    /// descends from. Two drivers are recognised:
+    ///
+    /// - the **ed25519 programmatic signer**: the top-level instruction is its
+    ///   `Submit`, and the list is the execution message handed to the
+    ///   message executor;
+    /// - **Vector**: the top-level instruction is a `Passthrough` of the
+    ///   program that owns the member account, with the member as its vector
+    ///   account. No other instruction of that program may appear in the
+    ///   transaction except `Advance`.
+    ///
+    /// The list is located by parsing the driver's framing, not from an
+    /// argument. It must contain this very invocation and otherwise consist
+    /// only of this program's instructions and the expected vote.
     pub fn verify_proposal_cpi(
         ctx: Context<VerifyProposalCpi>,
         args: VerifyProposalArgs,
-        location: VoteLocation,
     ) -> Result<()> {
         require!(
             get_stack_height() > TRANSACTION_LEVEL_STACK_HEIGHT,
@@ -126,7 +135,7 @@ pub mod squads_clear_signing {
             ClearSigningError::MemberAccountMismatch
         );
 
-        let (proposal_key, num_instructions) = verify_content(
+        let (proposal_key, vault_instructions) = verify_content(
             ctx.accounts.proposal.as_ref(),
             ctx.accounts.transaction.as_ref(),
             ctx.remaining_accounts,
@@ -135,16 +144,17 @@ pub mod squads_clear_signing {
 
         // The top-level instruction this CPI descends from.
         let sysvar_info = ctx.accounts.instructions_sysvar.to_account_info();
-        let current = sysvar_instructions::load_current_index_checked(&sysvar_info)
-            .map_err(|_| error!(ClearSigningError::InstructionsSysvarError))?;
-        let enclosing =
-            sysvar_instructions::load_instruction_at_checked(usize::from(current), &sysvar_info)
-                .map_err(|_| error!(ClearSigningError::InstructionsSysvarError))?;
+        let sysvar_error = |_| error!(ClearSigningError::InstructionsSysvarError);
+        let current = usize::from(
+            sysvar_instructions::load_current_index_checked(&sysvar_info).map_err(sysvar_error)?,
+        );
+        let driver = sysvar_instructions::load_instruction_at_checked(current, &sysvar_info)
+            .map_err(sysvar_error)?;
 
         // This invocation's own instruction data, to find it in the list.
-        let mut own_data = instruction::VerifyProposalCpi::DISCRIMINATOR.to_vec();
+        let mut own_data = Vec::with_capacity(driver.data.len());
+        own_data.extend_from_slice(instruction::VerifyProposalCpi::DISCRIMINATOR);
         args.serialize(&mut own_data)?;
-        location.serialize(&mut own_data)?;
 
         let expectation = VoteExpectation {
             self_program: crate::ID,
@@ -153,24 +163,33 @@ pub mod squads_clear_signing {
             member: args.member,
             action: args.action,
         };
-        match location {
-            VoteLocation::V1Message { offset } => validation::validate_embedded_v1_message(
-                &enclosing.data,
-                usize::from(offset),
+        if driver.program_id == validation::ED25519_SIGNER_PROGRAM_ID {
+            // Only this Submit's own execution can carry the member's
+            // signature, so the rest of the transaction is not restricted.
+            let message = validation::eps_execution_message(&driver.data)?;
+            validation::validate_embedded_v1_message(message, &own_data, &expectation)?;
+        } else if driver.program_id == *ctx.accounts.member.owner {
+            // A Vector account is owned by its Vector program, and only that
+            // program can sign for it.
+            validation::validate_vector_passthrough(
+                &driver.data,
+                &driver.accounts,
                 &own_data,
                 &expectation,
-            )?,
-            VoteLocation::Passthrough {
-                offset,
-                first_account,
-            } => validation::validate_embedded_passthrough(
-                &enclosing.data,
-                &enclosing.accounts,
-                usize::from(offset),
-                usize::from(first_account),
-                &own_data,
-                &expectation,
-            )?,
+            )?;
+            let num_instructions = {
+                let data = sysvar_info.try_borrow_data()?;
+                require!(data.len() >= 2, ClearSigningError::InstructionsSysvarError);
+                usize::from(u16::from_le_bytes([data[0], data[1]]))
+            };
+            for i in (0..num_instructions).filter(|&i| i != current) {
+                let ix = sysvar_instructions::load_instruction_at_checked(i, &sysvar_info)
+                    .map_err(sysvar_error)?;
+                validation::check_vector_sibling(&ix.program_id, &ix.data, &driver.program_id)?;
+            }
+        } else {
+            msg!("unsupported driver program {}", driver.program_id);
+            return err!(ClearSigningError::UnsupportedSignerDriver);
         }
 
         msg!(
@@ -179,9 +198,9 @@ pub mod squads_clear_signing {
             proposal_key,
             args.multisig,
             args.transaction_index,
-            num_instructions,
+            vault_instructions,
             args.member,
-            enclosing.program_id,
+            driver.program_id,
         );
         Ok(())
     }
@@ -450,28 +469,11 @@ pub struct VerifyProposalCpi<'info> {
     pub instructions_sysvar: UncheckedAccount<'info>,
 
     /// The multisig member casting the vote: the programmatic signer, which
-    /// must sign this CPI (and equal `args.member`).
+    /// must sign this CPI (and equal `args.member`). For Vector, this is the
+    /// vector account, owned by its Vector program.
     pub member: Signer<'info>,
     //
     // remaining_accounts: address lookup tables, as in `verify_proposal`.
-}
-
-/// Where `verify_proposal_cpi` finds the instruction list that carries the
-/// Squads vote, inside the data of the current top-level instruction.
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VoteLocation {
-    /// A serialized Solana v1 message starts at byte `offset` (its `0x81`
-    /// version byte) and runs to the end of the data. Program ids and
-    /// accounts are indexes into the message's own address table. This is
-    /// what the ed25519 programmatic signer's executor runs.
-    V1Message { offset: u16 },
-    /// A passthrough list starts at byte `offset` (its instruction count) and
-    /// runs to the end of the data: `count`, then per instruction
-    /// `{ num_accounts: u8, data_len: u16, data }`. Program ids and accounts
-    /// are the top-level instruction's own accounts, from index
-    /// `first_account` to the end: per instruction, the program, then its
-    /// accounts. This is Vector's `Passthrough` (`offset` 1, `first_account` 2).
-    Passthrough { offset: u16, first_account: u8 },
 }
 
 #[derive(Accounts)]

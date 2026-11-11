@@ -414,6 +414,7 @@ pub fn validate_transaction_shape(
             &ix.data,
             |n| ix.accounts.get(n).map(|m| (m.pubkey, m.is_signer)),
             expectation,
+            true,
             &mut votes,
         )?;
     }
@@ -422,18 +423,22 @@ pub fn validate_transaction_shape(
 }
 
 /// The shape rule for one instruction, shared by the top-level check and the
-/// embedded (CPI) checks: it must target this program or the compute budget
-/// program, or be exactly the expected Squads vote (counted in `votes`).
-/// `account(n)` yields the n-th account's `(pubkey, is_signer)`.
+/// embedded (CPI) checks: it must target this program (or, at top level only,
+/// the compute budget program), or be exactly the expected Squads vote
+/// (counted in `votes`). `account(n)` yields the n-th account's
+/// `(pubkey, is_signer)`.
 fn check_shape_instruction(
     i: usize,
     program_id: &Pubkey,
     data: &[u8],
     account: impl Fn(usize) -> Option<(Pubkey, bool)>,
     expectation: &VoteExpectation,
+    allow_compute_budget: bool,
     votes: &mut usize,
 ) -> Result<()> {
-    if *program_id == expectation.self_program || *program_id == COMPUTE_BUDGET_PROGRAM_ID {
+    if *program_id == expectation.self_program
+        || (allow_compute_budget && *program_id == COMPUTE_BUDGET_PROGRAM_ID)
+    {
         return Ok(());
     }
     if *program_id != SQUADS_PROGRAM_ID {
@@ -473,16 +478,34 @@ fn check_shape_instruction(
 //
 // When the member is a programmatic signer (a PDA that only signs inside a
 // CPI), the vote is not a top-level instruction: it is serialized inside the
-// data of the top-level instruction that drives the signer program. The
-// functions below parse that serialized instruction list at a caller-given
-// offset and apply the same shape rule to it.
+// top-level instruction of the signer program (the "driver") that this CPI
+// descends from. The functions below parse that driver instruction and apply
+// the shape rule to the instruction list it will execute.
 //
-// Three rules make the given offset hard to point at decoy bytes:
-//   * the list must run to the exact end of the enclosing instruction data
-//     (and, for passthrough, consume the account list exactly);
-//   * it must contain this very `verify_proposal_cpi` invocation, byte for
-//     byte (`own_data`), so it cannot be a fragment of our own arguments;
-//   * every instruction in it must pass the shape rule.
+// The list is located by parsing the driver's own framing from the start of
+// its instruction data, never from a caller-supplied offset: an offset chosen
+// by whoever builds the payload can be aimed at look-alike bytes (an address
+// table, another instruction's data) that the driver does not execute.
+
+/// The ed25519 programmatic signer program: verifies the authority's
+/// signature over an authorization message and CPIs the executor with the
+/// authority's PDA as signer.
+pub const ED25519_SIGNER_PROGRAM_ID: Pubkey =
+    pubkey!("EdSigVfK1DkeMrjFNDMjwfQaJPhPTtX7jW8uPv3oKEgN");
+
+/// The message executor the ed25519 signer hands its promoted signers to: it
+/// CPIs every instruction of the execution message, in order.
+pub const MESSAGE_EXECUTOR_PROGRAM_ID: Pubkey =
+    pubkey!("ExecxgyHYsAXB4c5dZodV1zJZ9hqfsDCYkRDRATrpkFR");
+
+/// ed25519 signer `Submit` / message executor `Execute` discriminators.
+const SUBMIT_DISCRIMINATOR: u8 = 0;
+const EXECUTE_DISCRIMINATOR: u8 = 0;
+/// Vector `Advance` / `Passthrough` discriminators.
+const VECTOR_ADVANCE_DISCRIMINATOR: u8 = 1;
+const VECTOR_PASSTHROUGH_DISCRIMINATOR: u8 = 4;
+/// Vector `Passthrough` accounts: `[vector PDA, instructions sysvar, payload...]`.
+const VECTOR_FIRST_PAYLOAD_ACCOUNT: usize = 2;
 
 /// Version prefix byte of a serialized Solana v1 message (SIMD-0385).
 const V1_MESSAGE_PREFIX: u8 = 0x81;
@@ -490,8 +513,100 @@ const V1_MESSAGE_PREFIX: u8 = 0x81;
 /// 32-byte lifetime specifier, instruction count, address count.
 const V1_FIXED_SIZE: usize = 42;
 
+fn bad_driver() -> Error {
+    error!(ClearSigningError::MalformedDriverInstruction)
+}
+
 fn malformed() -> Error {
     error!(ClearSigningError::MalformedEmbeddedInstructions)
+}
+
+/// The fixed part and address table of a v1 message with a zero config mask
+/// (a non-zero mask adds variable-size fields; neither program accepts one
+/// here). `rest` is everything after the address table.
+struct V1Prelude<'a> {
+    num_signers: usize,
+    num_instructions: usize,
+    addresses: &'a [u8],
+    rest: &'a [u8],
+}
+
+impl<'a> V1Prelude<'a> {
+    fn parse(m: &'a [u8]) -> Option<Self> {
+        if m.len() < V1_FIXED_SIZE || m[0] != V1_MESSAGE_PREFIX || m[4..8] != [0u8; 4] {
+            return None;
+        }
+        let end = V1_FIXED_SIZE + 32 * usize::from(m[41]);
+        Some(Self {
+            num_signers: usize::from(m[1]),
+            num_instructions: usize::from(m[40]),
+            addresses: m.get(V1_FIXED_SIZE..end)?,
+            rest: &m[end..],
+        })
+    }
+
+    fn key(&self, index: u8) -> Option<Pubkey> {
+        let start = usize::from(index) * 32;
+        let bytes = self.addresses.get(start..start + 32)?;
+        Some(Pubkey::new_from_array(bytes.try_into().unwrap()))
+    }
+}
+
+/// Parse the data of an ed25519 signer `Submit` instruction and return the
+/// serialized **execution message**: the v1 message whose instructions the
+/// executor will CPI.
+///
+/// ```text
+/// Submit data:  0x00 | n | n * (0x00 | 0x01 signature[64]) | authorization message
+/// authorization message (v1, config mask 0, exactly one instruction):
+///               ... | addresses | { program_id_index, num_accounts, data_len u16 }
+///               | account indexes | Execute data
+/// Execute data: 0x00 | execution message
+/// ```
+///
+/// Every field is walked from the start and the data must be consumed
+/// exactly, mirroring the signer program's own exact deserialization. The
+/// authorization message's single instruction must target the message
+/// executor's `Execute`.
+pub fn eps_execution_message(submit_data: &[u8]) -> Result<&[u8]> {
+    let (&discriminator, rest) = submit_data.split_first().ok_or_else(bad_driver)?;
+    require!(
+        discriminator == SUBMIT_DISCRIMINATOR,
+        ClearSigningError::MalformedDriverInstruction
+    );
+    let (&num_signatures, mut rest) = rest.split_first().ok_or_else(bad_driver)?;
+    for _ in 0..num_signatures {
+        let (&tag, after) = rest.split_first().ok_or_else(bad_driver)?;
+        rest = match tag {
+            0 => after,
+            1 => after.get(64..).ok_or_else(bad_driver)?,
+            _ => return Err(bad_driver()),
+        };
+    }
+
+    let authorization = V1Prelude::parse(rest).ok_or_else(bad_driver)?;
+    require!(
+        authorization.num_instructions == 1,
+        ClearSigningError::MalformedDriverInstruction
+    );
+    let header = authorization.rest.get(..4).ok_or_else(bad_driver)?;
+    let program_id = authorization.key(header[0]).ok_or_else(bad_driver)?;
+    let num_accounts = usize::from(header[1]);
+    let data_len = usize::from(u16::from_le_bytes([header[2], header[3]]));
+    let execute_data = authorization
+        .rest
+        .get(4 + num_accounts..)
+        .ok_or_else(bad_driver)?;
+    require!(
+        execute_data.len() == data_len && program_id == MESSAGE_EXECUTOR_PROGRAM_ID,
+        ClearSigningError::MalformedDriverInstruction
+    );
+    let (&discriminator, execution_message) = execute_data.split_first().ok_or_else(bad_driver)?;
+    require!(
+        discriminator == EXECUTE_DISCRIMINATOR,
+        ClearSigningError::MalformedDriverInstruction
+    );
+    Ok(execution_message)
 }
 
 fn finish_embedded(votes: usize, found_self: bool) -> Result<()> {
@@ -500,8 +615,8 @@ fn finish_embedded(votes: usize, found_self: bool) -> Result<()> {
     Ok(())
 }
 
-/// Validate a serialized Solana **v1 message** embedded in `data` at `offset`
-/// (the format the ed25519 programmatic signer's executor runs):
+/// Apply the shape rule to every instruction of a serialized Solana **v1
+/// message** (the execution message of the ed25519 programmatic signer):
 ///
 /// ```text
 /// 0x81 | num_required_signatures, num_readonly_signed, num_readonly_unsigned
@@ -511,50 +626,31 @@ fn finish_embedded(votes: usize, found_self: bool) -> Result<()> {
 ///      | payloads  [per instruction: account indexes, then data]
 /// ```
 ///
-/// An account is a signer of an embedded instruction iff its index is below
-/// `num_required_signatures`.
+/// `message` must be exactly the message. An account is a signer of an
+/// embedded instruction iff its index is below `num_required_signatures`.
+/// The list must also contain this very invocation (`own_data`).
 pub fn validate_embedded_v1_message(
-    data: &[u8],
-    offset: usize,
+    message: &[u8],
     own_data: &[u8],
     expectation: &VoteExpectation,
 ) -> Result<()> {
-    let m = data.get(offset..).ok_or_else(malformed)?;
-    require!(
-        m.len() >= V1_FIXED_SIZE && m[0] == V1_MESSAGE_PREFIX,
-        ClearSigningError::MalformedEmbeddedInstructions
-    );
-    let num_signers = usize::from(m[1]);
-    // A non-zero config mask adds variable-size fields; no driver sets it.
-    require!(
-        m[4..8] == [0u8; 4],
-        ClearSigningError::MalformedEmbeddedInstructions
-    );
-    let num_instructions = usize::from(m[40]);
-    let num_addresses = usize::from(m[41]);
-    let headers_start = V1_FIXED_SIZE + 32 * num_addresses;
-    let addresses = m.get(V1_FIXED_SIZE..headers_start).ok_or_else(malformed)?;
-    let mut cursor = headers_start + 4 * num_instructions;
-    let headers = m.get(headers_start..cursor).ok_or_else(malformed)?;
-    let key = |index: u8| -> Option<Pubkey> {
-        let start = usize::from(index) * 32;
-        let bytes = addresses.get(start..start + 32)?;
-        Some(Pubkey::new_from_array(bytes.try_into().unwrap()))
-    };
+    let m = V1Prelude::parse(message).ok_or_else(malformed)?;
+    let mut cursor = 4 * m.num_instructions;
+    let headers = m.rest.get(..cursor).ok_or_else(malformed)?;
 
     let mut votes = 0;
     let mut found_self = false;
     for (i, header) in headers.chunks_exact(4).enumerate() {
-        let program_id = key(header[0]).ok_or_else(malformed)?;
+        let program_id = m.key(header[0]).ok_or_else(malformed)?;
         let num_accounts = usize::from(header[1]);
         let data_len = usize::from(u16::from_le_bytes([header[2], header[3]]));
-        let indexes = m.get(cursor..cursor + num_accounts).ok_or_else(malformed)?;
+        let indexes = m.rest.get(cursor..cursor + num_accounts).ok_or_else(malformed)?;
         cursor += num_accounts;
-        let ix_data = m.get(cursor..cursor + data_len).ok_or_else(malformed)?;
+        let ix_data = m.rest.get(cursor..cursor + data_len).ok_or_else(malformed)?;
         cursor += data_len;
         // Every referenced account must resolve, even ones the rule ignores.
         for &index in indexes {
-            key(index).ok_or_else(malformed)?;
+            m.key(index).ok_or_else(malformed)?;
         }
         check_shape_instruction(
             i,
@@ -562,58 +658,62 @@ pub fn validate_embedded_v1_message(
             ix_data,
             |n| {
                 let index = *indexes.get(n)?;
-                Some((key(index)?, usize::from(index) < num_signers))
+                Some((m.key(index)?, usize::from(index) < m.num_signers))
             },
             expectation,
+            false,
             &mut votes,
         )?;
         found_self |= program_id == expectation.self_program && ix_data == own_data;
     }
-    require!(cursor == m.len(), ClearSigningError::EmbeddedTrailingBytes);
+    require!(
+        cursor == m.rest.len(),
+        ClearSigningError::EmbeddedTrailingBytes
+    );
     finish_embedded(votes, found_self)
 }
 
-/// Validate a **passthrough** instruction list embedded in `data` at `offset`
-/// (the format of Vector's `Passthrough`), where only the instruction data is
-/// serialized and the program ids and accounts are the enclosing
-/// instruction's own accounts, consumed in order from `first_account`:
+/// Apply the shape rule to every sub-instruction of a Vector `Passthrough`,
+/// given that top-level instruction's data and accounts:
 ///
 /// ```text
-/// data:     count u8 | count * { num_accounts u8, data_len u16, data }
-/// accounts: per instruction: program account, then its num_accounts accounts
+/// data:     0x04 | count u8 | count * { num_accounts u8, data_len u16, data }
+/// accounts: vector PDA, instructions sysvar,
+///           then per sub-instruction: program account, its num_accounts accounts
 /// ```
 ///
-/// The enclosing instruction's signer flags describe the transaction, not the
-/// CPI: a programmatic signer is promoted only inside the CPI. The expected
-/// member is therefore treated as a signer here; the caller has already
-/// required it to sign this very invocation, and Squads enforces it on the vote.
-pub fn validate_embedded_passthrough(
+/// The vector PDA (account 0) must be the expected member. Data and accounts
+/// must be consumed exactly, as Vector itself requires.
+///
+/// The top-level signer flags describe the transaction, not the CPI: Vector
+/// promotes its PDA to a signer in every sub-instruction that lists it, so
+/// the member counts as a signer of the embedded vote.
+pub fn validate_vector_passthrough(
     data: &[u8],
-    outer_accounts: &[anchor_lang::solana_program::instruction::AccountMeta],
-    offset: usize,
-    first_account: usize,
+    accounts: &[anchor_lang::solana_program::instruction::AccountMeta],
     own_data: &[u8],
     expectation: &VoteExpectation,
 ) -> Result<()> {
-    let d = data.get(offset..).ok_or_else(malformed)?;
-    let count = usize::from(*d.first().ok_or_else(malformed)?);
-    let mut cursor = 1;
-    let mut account_cursor = first_account;
+    require!(
+        data.first() == Some(&VECTOR_PASSTHROUGH_DISCRIMINATOR)
+            && accounts.first().map(|m| m.pubkey) == Some(expectation.member),
+        ClearSigningError::MalformedDriverInstruction
+    );
+    let count = usize::from(*data.get(1).ok_or_else(malformed)?);
+    let mut cursor = 2;
+    let mut account_cursor = VECTOR_FIRST_PAYLOAD_ACCOUNT;
 
     let mut votes = 0;
     let mut found_self = false;
     for i in 0..count {
-        let header = d.get(cursor..cursor + 3).ok_or_else(malformed)?;
+        let header = data.get(cursor..cursor + 3).ok_or_else(malformed)?;
         let num_accounts = usize::from(header[0]);
         let data_len = usize::from(u16::from_le_bytes([header[1], header[2]]));
         cursor += 3;
-        let ix_data = d.get(cursor..cursor + data_len).ok_or_else(malformed)?;
+        let ix_data = data.get(cursor..cursor + data_len).ok_or_else(malformed)?;
         cursor += data_len;
-        let program_id = outer_accounts
-            .get(account_cursor)
-            .ok_or_else(malformed)?
-            .pubkey;
-        let accounts = outer_accounts
+        let program_id = accounts.get(account_cursor).ok_or_else(malformed)?.pubkey;
+        let ix_accounts = accounts
             .get(account_cursor + 1..account_cursor + 1 + num_accounts)
             .ok_or_else(malformed)?;
         account_cursor += 1 + num_accounts;
@@ -622,22 +722,34 @@ pub fn validate_embedded_passthrough(
             &program_id,
             ix_data,
             |n| {
-                let meta = accounts.get(n)?;
+                let meta = ix_accounts.get(n)?;
                 Some((
                     meta.pubkey,
                     meta.is_signer || meta.pubkey == expectation.member,
                 ))
             },
             expectation,
+            false,
             &mut votes,
         )?;
         found_self |= program_id == expectation.self_program && ix_data == own_data;
     }
     require!(
-        cursor == d.len() && account_cursor == outer_accounts.len(),
+        cursor == data.len() && account_cursor == accounts.len(),
         ClearSigningError::EmbeddedTrailingBytes
     );
     finish_embedded(votes, found_self)
+}
+
+/// One Vector `Advance` authorizes every later `Passthrough` of the same
+/// transaction, so the transaction's other instructions of the Vector
+/// program must all be `Advance`s: a second `Passthrough` would use the
+/// member's signature outside the list checked above.
+pub fn check_vector_sibling(program_id: &Pubkey, data: &[u8], vector_program: &Pubkey) -> Result<()> {
+    if program_id == vector_program && data.first() != Some(&VECTOR_ADVANCE_DISCRIMINATOR) {
+        return err!(ClearSigningError::ForbiddenDriverInstruction);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1228,14 +1340,8 @@ mod tests {
         m
     }
 
-    /// Wrap a message in an envelope with a 7-byte prefix; returns (data, offset).
-    fn envelope(message: &[u8]) -> (Vec<u8>, usize) {
-        ([b"prefix!".to_vec(), message.to_vec()].concat(), 7)
-    }
-
     fn v1(signers: &[Pubkey], ixs: &[TestIx]) -> Result<()> {
-        let (data, offset) = envelope(&v1_message(signers, ixs));
-        validate_embedded_v1_message(&data, offset, OWN, &expectation())
+        validate_embedded_v1_message(&v1_message(signers, ixs), OWN, &expectation())
     }
 
     #[test]
@@ -1265,6 +1371,12 @@ mod tests {
             code(v1(&signers, &[embedded_self(), embedded_vote(pk(102)), foreign])),
             err_code(ClearSigningError::ForbiddenInstruction)
         );
+        // Compute budget is tolerated at top level only, not in an embedded list.
+        let budget = (COMPUTE_BUDGET_PROGRAM_ID, vec![], vec![2, 0, 0, 0, 0]);
+        assert_eq!(
+            code(v1(&signers, &[budget, embedded_self(), embedded_vote(pk(102))])),
+            err_code(ClearSigningError::ForbiddenInstruction)
+        );
         // A second, different Squads vote.
         assert_eq!(
             code(v1(&signers, &[embedded_self(), embedded_vote(pk(102)), embedded_vote(pk(66))])),
@@ -1275,7 +1387,7 @@ mod tests {
             code(v1(&[pk(77)], &[embedded_self(), embedded_vote(pk(102))])),
             err_code(ClearSigningError::VoteMemberNotSigner)
         );
-        // This invocation is not in the list (different data => a decoy list).
+        // This invocation is not in the list.
         let other_self = (pk(100), vec![], b"some-other-verify".to_vec());
         assert_eq!(
             code(v1(&signers, &[other_self, embedded_vote(pk(102))])),
@@ -1287,36 +1399,128 @@ mod tests {
     fn v1_rejects_bad_framing() {
         let exp = expectation();
         let message = v1_message(&[pk(103)], &[embedded_self(), embedded_vote(pk(102))]);
-        let (data, offset) = envelope(&message);
-        let check = |d: &[u8], o: usize| code(validate_embedded_v1_message(d, o, OWN, &exp));
+        let check = |m: &[u8]| code(validate_embedded_v1_message(m, OWN, &exp));
         let malformed = err_code(ClearSigningError::MalformedEmbeddedInstructions);
 
-        // Offset past the end, wrong offset (no 0x81 there), truncated header.
-        assert_eq!(check(&data, data.len() + 1), malformed);
-        assert_eq!(check(&data, offset + 1), malformed);
-        assert_eq!(check(&data[..offset + 20], offset), malformed);
-        // Truncated payload.
-        assert_eq!(check(&data[..data.len() - 1], offset), malformed);
+        // Not a v1 message, truncated header, truncated payload.
+        assert_eq!(check(&message[1..]), malformed);
+        assert_eq!(check(&message[..20]), malformed);
+        assert_eq!(check(&message[..message.len() - 1]), malformed);
         // Trailing bytes after the message.
-        let mut trailing = data.clone();
+        let mut trailing = message.clone();
         trailing.push(0);
         assert_eq!(
-            check(&trailing, offset),
+            check(&trailing),
             err_code(ClearSigningError::EmbeddedTrailingBytes)
         );
         // Non-zero config mask.
-        let mut masked = data.clone();
-        masked[offset + 4] = 1;
-        assert_eq!(check(&masked, offset), malformed);
+        let mut masked = message.clone();
+        masked[4] = 1;
+        assert_eq!(check(&masked), malformed);
         // Account index beyond the key table (last payload = vote: 3 indexes + 9 data bytes).
-        let mut oob = data.clone();
+        let mut oob = message.clone();
         let n = oob.len();
         oob[n - 10] = 250;
-        assert_eq!(check(&oob, offset), malformed);
+        assert_eq!(check(&oob), malformed);
     }
 
-    /// Passthrough envelope: `[tag, count, entries...]`, accounts
-    /// `[signer pda, sysvar, (program, accounts...)*]`; offset 1, first account 2.
+    /// ed25519 signer `Submit` data around an execution message: `sigs` are the
+    /// per-signer presence flags, `junk_keys` extra authorization-message
+    /// addresses (bytes an attacker fully controls).
+    fn submit_data(execution_message: &[u8], sigs: &[bool], junk_keys: &[[u8; 32]]) -> Vec<u8> {
+        let mut execute = vec![0u8];
+        execute.extend_from_slice(execution_message);
+        // Authorization message: keys = [authority, executor, junk...], one instruction.
+        let mut auth = vec![0x81, sigs.len() as u8, 0, 0];
+        auth.extend_from_slice(&0u32.to_le_bytes());
+        auth.extend_from_slice(&[0; 32]);
+        auth.push(1);
+        auth.push(2 + junk_keys.len() as u8);
+        auth.extend_from_slice(pk(103).as_ref());
+        auth.extend_from_slice(MESSAGE_EXECUTOR_PROGRAM_ID.as_ref());
+        for k in junk_keys {
+            auth.extend_from_slice(k);
+        }
+        auth.extend_from_slice(&[1, 1]);
+        auth.extend_from_slice(&(execute.len() as u16).to_le_bytes());
+        auth.push(0);
+        auth.extend_from_slice(&execute);
+
+        let mut data = vec![0u8, sigs.len() as u8];
+        for &present in sigs {
+            if present {
+                data.push(1);
+                data.extend_from_slice(&[0x55; 64]);
+            } else {
+                data.push(0);
+            }
+        }
+        data.extend_from_slice(&auth);
+        data
+    }
+
+    #[test]
+    fn eps_locates_execution_message() {
+        let message = v1_message(&[pk(103)], &[embedded_self(), embedded_vote(pk(102))]);
+        // The location does not depend on which signatures are present.
+        for sigs in [&[true][..], &[false], &[true, false, true]] {
+            let data = submit_data(&message, sigs, &[]);
+            assert_eq!(eps_execution_message(&data).unwrap(), &message[..]);
+        }
+        // Extra addresses in the authorization message do not move what is
+        // found: the execution message is located by walking the framing.
+        let junk = v1_message(&[pk(103)], &[embedded_self(), embedded_vote(pk(66))]);
+        let mut keys = vec![];
+        for chunk in junk.chunks(32) {
+            let mut k = [0u8; 32];
+            k[..chunk.len()].copy_from_slice(chunk);
+            keys.push(k);
+        }
+        let data = submit_data(&message, &[true], &keys);
+        assert_eq!(eps_execution_message(&data).unwrap(), &message[..]);
+    }
+
+    #[test]
+    fn eps_rejects_bad_framing() {
+        let message = v1_message(&[pk(103)], &[embedded_self(), embedded_vote(pk(102))]);
+        let data = submit_data(&message, &[true], &[]);
+        let bad = err_code(ClearSigningError::MalformedDriverInstruction);
+        let check = |d: &[u8]| code(eps_execution_message(d).map(|_| ()));
+
+        assert_eq!(check(&[]), bad);
+        // Not a Submit.
+        let mut other = data.clone();
+        other[0] = 1;
+        assert_eq!(check(&other), bad);
+        // Invalid signature option tag.
+        let mut tag = data.clone();
+        tag[2] = 2;
+        assert_eq!(check(&tag), bad);
+        // Truncated, and trailing bytes after the Execute data.
+        assert_eq!(check(&data[..data.len() - 1]), bad);
+        let mut trailing = data.clone();
+        trailing.push(0);
+        assert_eq!(check(&trailing), bad);
+        // Authorization message offsets: prefix at 67, instruction count at 107,
+        // executor key at 109 + 32, Execute discriminator right before the message.
+        let auth = 2 + 65;
+        let mut two = data.clone();
+        two[auth + 40] = 2;
+        assert_eq!(check(&two), bad);
+        let mut masked = data.clone();
+        masked[auth + 4] = 1;
+        assert_eq!(check(&masked), bad);
+        let mut executor = data.clone();
+        executor[auth + 42 + 32] ^= 1;
+        assert_eq!(check(&executor), bad);
+        let mut not_execute = data.clone();
+        let d = data.len() - message.len() - 1;
+        not_execute[d] = 1;
+        assert_eq!(check(&not_execute), bad);
+    }
+
+    /// Vector `Passthrough`: data `[4, count, entries...]`, accounts
+    /// `[vector pda, sysvar, (program, accounts...)*]`.
     fn passthrough(ixs: &[TestIx]) -> (Vec<u8>, Vec<AccountMeta>) {
         let mut data = vec![4u8, ixs.len() as u8];
         let mut metas = vec![
@@ -1336,7 +1540,7 @@ mod tests {
 
     fn pt(ixs: &[TestIx]) -> Result<()> {
         let (data, metas) = passthrough(ixs);
-        validate_embedded_passthrough(&data, &metas, 1, 2, OWN, &expectation())
+        validate_vector_passthrough(&data, &metas, OWN, &expectation())
     }
 
     #[test]
@@ -1373,28 +1577,49 @@ mod tests {
 
         let exp = expectation();
         let (data, metas) = passthrough(&[embedded_self(), embedded_vote(pk(102))]);
-        let check = |d: &[u8], m: &[AccountMeta], o: usize, a: usize| {
-            code(validate_embedded_passthrough(d, m, o, a, OWN, &exp))
+        let check = |d: &[u8], m: &[AccountMeta]| {
+            code(validate_vector_passthrough(d, m, OWN, &exp))
         };
+        let bad_driver = err_code(ClearSigningError::MalformedDriverInstruction);
         let malformed = err_code(ClearSigningError::MalformedEmbeddedInstructions);
         let trailing = err_code(ClearSigningError::EmbeddedTrailingBytes);
+        // Not a Passthrough; a Passthrough of a different vector PDA.
+        let mut advance = data.clone();
+        advance[0] = 1;
+        assert_eq!(check(&advance, &metas), bad_driver);
+        let mut other_pda = metas.clone();
+        other_pda[0].pubkey = pk(66);
+        assert_eq!(check(&data, &other_pda), bad_driver);
         // Truncated data, missing accounts.
-        assert_eq!(check(&data[..data.len() - 1], &metas, 1, 2), malformed);
-        assert_eq!(check(&data, &metas[..metas.len() - 1], 1, 2), malformed);
-        assert_eq!(check(&data, &metas, data.len(), 2), malformed);
+        assert_eq!(check(&data[..data.len() - 1], &metas), malformed);
+        assert_eq!(check(&data, &metas[..metas.len() - 1]), malformed);
         // Extra data bytes / extra accounts left unconsumed.
         let mut longer = data.clone();
         longer.push(0);
-        assert_eq!(check(&longer, &metas, 1, 2), trailing);
+        assert_eq!(check(&longer, &metas), trailing);
         let mut more = metas.clone();
         more.push(AccountMeta::new_readonly(pk(1), false));
-        assert_eq!(check(&data, &more, 1, 2), trailing);
+        assert_eq!(check(&data, &more), trailing);
+    }
+
+    #[test]
+    fn vector_siblings_must_be_advances() {
+        let vector = pk(150);
+        check_vector_sibling(&vector, &[1, 0xAA], &vector).unwrap();
+        // Other programs are not the member's signer: unrestricted.
+        check_vector_sibling(&pk(200), &[4], &vector).unwrap();
+        for data in [&[4u8, 1][..], &[0], &[]] {
+            assert_eq!(
+                code(check_vector_sibling(&vector, data, &vector)),
+                err_code(ClearSigningError::ForbiddenDriverInstruction)
+            );
+        }
     }
 
     #[test]
     fn cpi_error_codes_are_appended() {
         assert_eq!(err_code(ClearSigningError::ProgramHashMismatch), 6047);
         assert_eq!(err_code(ClearSigningError::NotInvokedViaCpi), 6048);
-        assert_eq!(err_code(ClearSigningError::EmbeddedSelfInstructionMissing), 6052);
+        assert_eq!(err_code(ClearSigningError::ForbiddenDriverInstruction), 6055);
     }
 }

@@ -106,10 +106,16 @@ pub enum ClearSigningError {
     NotInvokedViaCpi,
     #[msg("Member account does not match the member in the args")]
     MemberAccountMismatch,
-    #[msg("Embedded instructions at the given offset are malformed or out of bounds")]
+    #[msg("The top-level instruction is not a supported programmatic-signer driver for this member")]
+    UnsupportedSignerDriver,
+    #[msg("The driver's top-level instruction does not have the expected layout")]
+    MalformedDriverInstruction,
+    #[msg("The driver's embedded instruction list is malformed or out of bounds")]
     MalformedEmbeddedInstructions,
-    #[msg("Embedded instructions do not end exactly at the end of the enclosing instruction")]
+    #[msg("The driver's embedded instruction list has trailing bytes or accounts")]
     EmbeddedTrailingBytes,
-    #[msg("Embedded instructions do not contain this verify_proposal_cpi instruction")]
+    #[msg("The driver's embedded instruction list does not contain this verify_proposal_cpi instruction")]
     EmbeddedSelfInstructionMissing,
+    #[msg("Another instruction of the driver program in this transaction could use the member's signature")]
+    ForbiddenDriverInstruction,
 }
