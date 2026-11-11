@@ -71,7 +71,7 @@ The coordinator **prepends** instructions from the companion program to the same
 
 ```
 tx = [ verify_buffer_hash(buffer, sha256-hex)     ← only for program upgrades
-       assert_account_hash / assert_program_revision ← optional: pin other state
+       assert_*                                   ← optional: pin other state
        verify_proposal(expected instructions)     ← full inner content, IDL-decodable
        proposal_approve(#42) ]                    ← the vote
 ```
@@ -109,7 +109,7 @@ flowchart LR
 ```
 
 - **Buffer hash** (upgrade proposals): the device displays a SHA-256 digest that is byte-identical to `solana-verify get-buffer-hash`, so the signer can compare the build being deployed against a reviewed or reproducible build.
-- **State pins** (optional): `assert_account_hash` pins any account's raw data (and optionally its owner); `assert_program_revision` pins a deployed program's build, following the program account to its ProgramData and matching `solana-verify get-program-hash`.
+- **State pins** (optional): `assert_account_hash` pins any account's raw data (and optionally its owner); `assert_program_revision` pins a deployed program's build, following the program account to its ProgramData and matching `solana-verify get-program-hash`. `assert_program_deploy_slot` does the same by the slot of the last deploy, which is cheaper but shows the signer no build hash.
 - **The companion program can only abort.** It holds no authority and isn't in the CPI path of the vote. The worst a bug can do is reject a valid vote. It can't forge one.
 
 ### Programmatic signers
@@ -171,4 +171,4 @@ A dishonest coordinator has two options. It can show data that doesn't match the
 - **Validated on devnet** against live Squads v4, otter-verify and program-metadata. This covers a bundled *upgrade + verify-build + IDL* proposal (both tamper cases abort; the honest approval executes).
 - **Size:** content is duplicated into the approval tx. Larger bundles use **v1 (4 KB) transactions** (about 1.8 KB for the 5-instruction bundle). A hash-commitment mode could lift the limit further.
 - **Scope:** only `VaultTransaction` proposals. `ConfigTransaction` (key/threshold changes) and `Batch` need a sibling `verify_config_proposal`.
-- **Device policy required:** sign only `[compute budget*, verify_buffer_hash?, (assert_account_hash | assert_program_revision)*, verify_proposal, proposal_approve]` using the known program ID. With a programmatic signer, the device signs the driver's payload and applies the same rule to the list it decodes from that payload: sign only if it is `[verify_buffer_hash?, (assert_account_hash | assert_program_revision)*, verify_proposal_cpi, proposal_approve]`. The program locates the list itself, so there is no location for the device to check.
+- **Device policy required:** sign only `[compute budget*, verify_buffer_hash?, (assert_account_hash | assert_program_revision | assert_program_deploy_slot)*, verify_proposal, proposal_approve]` using the known program ID. With a programmatic signer, the device signs the driver's payload and applies the same rule to the list it decodes from that payload: sign only if it is `[verify_buffer_hash?, (assert_account_hash | assert_program_revision | assert_program_deploy_slot)*, verify_proposal_cpi, proposal_approve]`. The program locates the list itself, so there is no location for the device to check.

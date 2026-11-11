@@ -122,4 +122,7 @@ pub enum ClearSigningError {
     MemberIsTransactionSigner,
     #[msg("verify_proposal_cpi was not invoked directly by the driver")]
     UnexpectedStackHeight,
+    // --- assert_program_deploy_slot (6058) ---
+    #[msg("Program was not last deployed in the expected slot")]
+    ProgramDeploySlotMismatch,
 }

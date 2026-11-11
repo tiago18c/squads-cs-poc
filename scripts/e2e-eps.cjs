@@ -512,7 +512,20 @@ async function main() {
   const tampered = expected.map((ix) => ({ ...ix, data: Buffer.from(ix.data) }));
   tampered[0].data[4] ^= 0xff; // corrupt the u64 lamports of the transfer
   if (tampered[0].data.equals(expected[0].data)) throw new Error("tampering had no effect");
-  const honestInner = async () => [assertMultisigIx, await verifyCpiIx(), approveIx(honest.index)];
+  /** assert_program_deploy_slot for `programKey`, with the slot read from chain:
+   *  pins the driver's current deployment from inside its own instruction list. */
+  const deploySlotIx = async (programKey) => {
+    const info = await connection.getAccountInfo(programKey);
+    const programData = new PublicKey(info.data.subarray(4, 36));
+    const slot = (await connection.getAccountInfo(programData)).data.readBigUInt64LE(4);
+    return program.methods
+      .assertProgramDeploySlot({ program: programKey, expectedSlot: new anchor.BN(slot.toString()) })
+      .accounts({ program: programKey, programData })
+      .instruction();
+  };
+  const honestInner = async () => [
+    assertMultisigIx, await deploySlotIx(EPS_SIGNER), await verifyCpiIx(), approveIx(honest.index),
+  ];
   const viaEps = async (inner) => sendV1([(await buildSubmit(inner)).submit]);
 
   const negatives = [
