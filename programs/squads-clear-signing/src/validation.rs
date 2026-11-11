@@ -704,6 +704,14 @@ mod tests {
                     reference(&data),
                     "total {total}, nonzero at {pos:?}"
                 );
+                // An extra non-zero byte in an earlier chunk must not matter
+                // once a later one exists.
+                if let Some(p) = pos {
+                    if p > 0 {
+                        data[0] = 0x01;
+                        assert_eq!(trim_trailing_zeros(&data).len(), reference(&data));
+                    }
+                }
             }
         }
     }

@@ -131,4 +131,4 @@ A dishonest coordinator has two options. It can show data that doesn't match the
 - **Validated on devnet** against live Squads v4, otter-verify and program-metadata. This covers a bundled *upgrade + verify-build + IDL* proposal (both tamper cases abort; the honest approval executes).
 - **Size:** content is duplicated into the approval tx. Larger bundles use **v1 (4 KB) transactions** (about 1.8 KB for the 5-instruction bundle). A hash-commitment mode could lift the limit further.
 - **Scope:** only `VaultTransaction` proposals. `ConfigTransaction` (key/threshold changes) and `Batch` need a sibling `verify_config_proposal`.
-- **Device policy required:** sign only `[compute budget*, verify_*, proposal_approve]` using the known program ID.
+- **Device policy required:** sign only `[compute budget*, verify_buffer_hash?, (assert_account_hash | assert_program_revision)*, verify_proposal, proposal_approve]` using the known program ID.

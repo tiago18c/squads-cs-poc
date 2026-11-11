@@ -166,8 +166,9 @@ loader-v3 owner and `Buffer` state tag, extracts the program bytes, and hashes t
 exact convention (and exact digest) of `solana-verify get-buffer-hash`. `expected_hash` is a
 **lowercase-hex `String` (64 chars)** — not a raw byte array — so the offline device renders the
 *human-readable digest* the signer compares against `solana-verify`, instead of opaque numbers.
-On-chain the program hex-decodes it (rejecting wrong length / non-hex) and compares bytes; both the
-hash (a few hundred CU) and the hex parse are negligible. Any mismatch aborts.
+On-chain the program hex-decodes it (rejecting wrong length / non-hex) and compares bytes. Hashing
+costs about 0.5 CU per trimmed program byte (≈500k CU for a 1 MB build), so wallets should raise the
+compute-unit limit on upgrade votes. Any mismatch aborts.
 
 > Earlier iterations hashed with `brine-ed25519`, which only offers SHA-512 — a valid commitment,
 > but **not** the digest `solana-verify` prints (SHA-256). Switching to the native SHA-256 syscall
@@ -328,8 +329,8 @@ program) and executes the vault transaction.
 `run-e2e.sh` then runs `scripts/e2e-assert.cjs`: one-instruction cases for `assert_account_hash` /
 `assert_program_revision`, each checked on-chain. They cover the honest paths, including Squads v4
 (a large, zero-padded ProgramData), and every failure code except `NotAProgramData` (6046). That
-one is defence in depth: a loader-owned account at a Program's stored address is always its
-ProgramData. The failure cases are wrong owner, wrong or malformed hash, args/account mismatch,
+one is defence in depth: across transactions, a loader-owned account at a Program's stored address
+is always its ProgramData; it could only differ within a transaction that also closes the program. The failure cases are wrong owner, wrong or malformed hash, args/account mismatch,
 ProgramData passed as the program, a non-loader account, another program's ProgramData, and a
 closed program (a throwaway deploy, so the wallet needs about 3 SOL, refunded on close). The two
 Squads cases run only where Squads v4 exists (surfpool, devnet, mainnet).

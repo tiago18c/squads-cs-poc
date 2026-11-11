@@ -2,8 +2,9 @@
 /**
  * On-chain checks for `assert_account_hash` and `assert_program_revision`
  * against a live cluster (surfpool or devnet). Needs no multisig: both
- * instructions are standalone assertions, so each case is a one-instruction
- * transaction sent with skipPreflight (failures are recorded on-chain).
+ * instructions are standalone assertions, so each case is one assertion (plus
+ * a 1.4M CU compute-budget instruction) sent with skipPreflight, so failures
+ * are recorded on-chain.
  *
  * Targets:
  *   - assert_account_hash on the clear-signing Program account itself
@@ -11,6 +12,10 @@
  *   - assert_program_revision on the clear-signing program, with the expected
  *     digest read from its ProgramData (== `solana-verify get-program-hash`),
  *     cross-checked against target/deploy/squads_clear_signing.so if present
+ *   - assert_program_revision on Squads v4 (large, zero-padded ProgramData)
+ *     when it exists on the cluster
+ *   - a throwaway program deployed and closed via the `solana` CLI (must be on
+ *     PATH; needs ~3 SOL, refunded on close), for InvalidProgramDataOwner
  *
  * Env:
  *   RPC_URL  target cluster (default http://127.0.0.1:8899)
@@ -63,6 +68,7 @@ function deployAndCloseProgram() {
   try {
     cli("program", "deploy", SO_PATH, "--program-id", kpPath);
     const id = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(kpPath)))).publicKey;
+    console.log(`  deployed throwaway ${id.toBase58()}; closing (reclaim manually if this fails)`);
     cli("program", "close", id.toBase58(), "--bypass-warning");
     return id;
   } finally {
@@ -126,6 +132,7 @@ async function main() {
   step("deploying + closing a throwaway program (for the closed-ProgramData case)");
   const closedProgram = deployAndCloseProgram();
   if (closedProgram) ok(`closed program: ${closedProgram.toBase58()}`);
+  else console.log(`  SKIPPED closed-program case: ${SO_PATH} not found`);
 
   const accountHashIx = (args, account = args.account) => program.methods
     .assertAccountHash(args).accounts({ account }).instruction();
