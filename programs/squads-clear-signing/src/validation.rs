@@ -374,6 +374,19 @@ pub fn extract_programdata_program_bytes(data: &[u8]) -> Result<&[u8]> {
     Ok(&data[PROGRAMDATA_METADATA_SIZE..])
 }
 
+/// The slot a loader-v3 `ProgramData` account was last deployed in: the u64
+/// after the state tag, which the loader sets on every deploy, upgrade and
+/// extend.
+pub fn parse_programdata_slot(data: &[u8]) -> Result<u64> {
+    require!(
+        data.len() >= PROGRAMDATA_METADATA_SIZE,
+        ClearSigningError::NotAProgramData
+    );
+    let tag = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    require!(tag == PROGRAMDATA_STATE_TAG, ClearSigningError::NotAProgramData);
+    Ok(u64::from_le_bytes(data[4..12].try_into().unwrap()))
+}
+
 /// Encode a 32-byte digest as a lowercase-hex string (for log/error output).
 pub fn hash_to_hex(hash: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -1213,6 +1226,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_programdata_slot() {
+        let mut data = vec![0u8; PROGRAMDATA_METADATA_SIZE];
+        data[0] = 3;
+        data[4..12].copy_from_slice(&521_229_740u64.to_le_bytes());
+        data.extend_from_slice(b"elf");
+        assert_eq!(parse_programdata_slot(&data).unwrap(), 521_229_740);
+        // The slot is independent of the program bytes that follow.
+        assert_eq!(parse_programdata_slot(&data[..PROGRAMDATA_METADATA_SIZE]).unwrap(), 521_229_740);
+
+        // A Buffer or a Program account has no deploy slot.
+        for tag in [0u8, 1, 2] {
+            let mut bad = data.clone();
+            bad[0] = tag;
+            assert_eq!(
+                code(parse_programdata_slot(&bad).map(|_| ())),
+                err_code(ClearSigningError::NotAProgramData)
+            );
+        }
+        // Truncated, and a closed ProgramData (the loader leaves 4 bytes).
+        for len in [44, 4] {
+            assert_eq!(
+                code(parse_programdata_slot(&data[..len]).map(|_| ())),
+                err_code(ClearSigningError::NotAProgramData)
+            );
+        }
+    }
+
+    #[test]
     fn new_error_codes_are_appended() {
         // Existing codes must not move when variants are added.
         assert_eq!(err_code(ClearSigningError::ProposalIndexMismatch), 6036);
@@ -1750,5 +1791,6 @@ mod tests {
         assert_eq!(err_code(ClearSigningError::ForbiddenDriverInstruction), 6055);
         assert_eq!(err_code(ClearSigningError::MemberIsTransactionSigner), 6056);
         assert_eq!(err_code(ClearSigningError::UnexpectedStackHeight), 6057);
+        assert_eq!(err_code(ClearSigningError::ProgramDeploySlotMismatch), 6058);
     }
 }

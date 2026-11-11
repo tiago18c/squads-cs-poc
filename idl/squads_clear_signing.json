@@ -269,6 +269,62 @@
           }
         }
       ]
+    },
+    {
+      "name": "assert_program_deploy_slot",
+      "docs": [
+        "Assert that a deployed loader-v3 program was last modified in",
+        "`args.expected_slot`: the slot the loader records in the ProgramData",
+        "account on every deploy, upgrade and extend. A cheap alternative to",
+        "`assert_program_revision` for \"this program has not changed since I",
+        "looked\": it reads eight bytes where the revision check hashes the",
+        "whole program.",
+        "",
+        "The program and ProgramData accounts are checked exactly as in",
+        "`assert_program_revision`. The loader allows one change per program",
+        "per slot, so a matching slot means the program bytes are the ones",
+        "written in that slot. It says nothing about what that code is: the",
+        "signer must have read the slot and reviewed the code from the same",
+        "finalized snapshot of the ProgramData account.",
+        "",
+        "Extending a program is permissionless and also moves the slot, so",
+        "anyone can make this assertion fail without changing the code. Use",
+        "`assert_program_revision` where that matters."
+      ],
+      "discriminator": [
+        61,
+        69,
+        27,
+        39,
+        126,
+        73,
+        57,
+        199
+      ],
+      "accounts": [
+        {
+          "name": "program",
+          "docs": [
+            "The loader-v3 Program account (the program id)."
+          ]
+        },
+        {
+          "name": "program_data",
+          "docs": [
+            "The ProgramData account the program account points at."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "args",
+          "type": {
+            "defined": {
+              "name": "AssertProgramDeploySlotArgs"
+            }
+          }
+        }
+      ]
     }
   ],
   "types": [
@@ -518,6 +574,34 @@
               "`solana-verify get-program-hash <program>`."
             ],
             "type": "string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AssertProgramDeploySlotArgs",
+      "docs": [
+        "Binds a deployed upgradeable program to the deployment the offline signer",
+        "reviewed, by the slot it was last deployed in."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "program",
+            "docs": [
+              "The program id under verification (must equal the passed account)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "expected_slot",
+            "docs": [
+              "The slot of the program's last deploy, upgrade or extend, as recorded",
+              "by the loader (\"Last Deployed In Slot\" in `solana program show`). Take",
+              "it from the same finalized ProgramData snapshot as the reviewed code."
+            ],
+            "type": "u64"
           }
         ]
       }
@@ -813,6 +897,11 @@
       "code": 6057,
       "name": "UnexpectedStackHeight",
       "msg": "verify_proposal_cpi was not invoked directly by the driver"
+    },
+    {
+      "code": 6058,
+      "name": "ProgramDeploySlotMismatch",
+      "msg": "Program was not last deployed in the expected slot"
     }
   ]
 }

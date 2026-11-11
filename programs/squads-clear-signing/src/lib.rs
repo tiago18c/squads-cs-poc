@@ -340,29 +340,8 @@ pub mod squads_clear_signing {
         let program = &ctx.accounts.program;
         let program_data = &ctx.accounts.program_data;
 
-        // 1. The program account itself.
-        require_keys_eq!(program.key(), args.program, ClearSigningError::ProgramKeyMismatch);
-        require_keys_eq!(
-            *program.owner,
-            validation::BPF_LOADER_UPGRADEABLE_ID,
-            ClearSigningError::InvalidProgramOwner
-        );
-        let programdata_address = {
-            let data = program.try_borrow_data()?;
-            validation::parse_program_account(&data)?
-        };
-
-        // 2. Its contents must point at the passed ProgramData account.
-        require_keys_eq!(
-            program_data.key(),
-            programdata_address,
-            ClearSigningError::ProgramDataAddressMismatch
-        );
-        require_keys_eq!(
-            *program_data.owner,
-            validation::BPF_LOADER_UPGRADEABLE_ID,
-            ClearSigningError::InvalidProgramDataOwner
-        );
+        // 1-2. The program account, and the ProgramData it points at.
+        check_program_link(program.as_ref(), program_data.as_ref(), &args.program)?;
 
         // 3. The ProgramData's program bytes hash.
         let data = program_data.try_borrow_data()?;
@@ -382,6 +361,86 @@ pub mod squads_clear_signing {
         );
         Ok(())
     }
+
+    /// Assert that a deployed loader-v3 program was last modified in
+    /// `args.expected_slot`: the slot the loader records in the ProgramData
+    /// account on every deploy, upgrade and extend. A cheap alternative to
+    /// `assert_program_revision` for "this program has not changed since I
+    /// looked": it reads eight bytes where the revision check hashes the
+    /// whole program.
+    ///
+    /// The program and ProgramData accounts are checked exactly as in
+    /// `assert_program_revision`. The loader allows one change per program
+    /// per slot, so a matching slot means the program bytes are the ones
+    /// written in that slot. It says nothing about what that code is: the
+    /// signer must have read the slot and reviewed the code from the same
+    /// finalized snapshot of the ProgramData account.
+    ///
+    /// Extending a program is permissionless and also moves the slot, so
+    /// anyone can make this assertion fail without changing the code. Use
+    /// `assert_program_revision` where that matters.
+    pub fn assert_program_deploy_slot(
+        ctx: Context<AssertProgramDeploySlot>,
+        args: AssertProgramDeploySlotArgs,
+    ) -> Result<()> {
+        let program = &ctx.accounts.program;
+        let program_data = &ctx.accounts.program_data;
+        check_program_link(program.as_ref(), program_data.as_ref(), &args.program)?;
+
+        let slot = {
+            let data = program_data.try_borrow_data()?;
+            validation::parse_programdata_slot(&data)?
+        };
+        if slot != args.expected_slot {
+            msg!(
+                "program {} was last deployed in slot {}, expected {}",
+                program.key(),
+                slot,
+                args.expected_slot
+            );
+            return err!(ClearSigningError::ProgramDeploySlotMismatch);
+        }
+        msg!("program deploy slot OK: {} (slot {})", program.key(), slot);
+        Ok(())
+    }
+}
+
+/// The checks shared by `assert_program_revision` and
+/// `assert_program_deploy_slot`: `program` is the expected loader-v3 Program
+/// account, and `program_data` is the ProgramData account it points at.
+fn check_program_link(
+    program: &AccountInfo,
+    program_data: &AccountInfo,
+    expected_program: &Pubkey,
+) -> Result<()> {
+    // 1. The program account itself.
+    require_keys_eq!(
+        program.key(),
+        *expected_program,
+        ClearSigningError::ProgramKeyMismatch
+    );
+    require_keys_eq!(
+        *program.owner,
+        validation::BPF_LOADER_UPGRADEABLE_ID,
+        ClearSigningError::InvalidProgramOwner
+    );
+    let programdata_address = {
+        let data = program.try_borrow_data()?;
+        validation::parse_program_account(&data)?
+    };
+
+    // 2. Its contents must point at the passed ProgramData account.
+    require_keys_eq!(
+        program_data.key(),
+        programdata_address,
+        ClearSigningError::ProgramDataAddressMismatch
+    );
+    require_keys_eq!(
+        *program_data.owner,
+        validation::BPF_LOADER_UPGRADEABLE_ID,
+        ClearSigningError::InvalidProgramDataOwner
+    );
+    Ok(())
 }
 
 /// The content checks shared by `verify_proposal` and `verify_proposal_cpi`:
@@ -547,6 +606,28 @@ pub struct AssertProgramRevision<'info> {
     /// CHECK: must equal the program's stored `programdata_address`; owner,
     /// `ProgramData` state, and program-bytes hash are validated in the handler.
     pub program_data: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct AssertProgramDeploySlot<'info> {
+    /// The loader-v3 Program account (the program id).
+    /// CHECK: key, owner, and `Program` state are validated in the handler.
+    pub program: UncheckedAccount<'info>,
+    /// The ProgramData account the program account points at.
+    /// CHECK: address, owner, state and deploy slot are validated in the handler.
+    pub program_data: UncheckedAccount<'info>,
+}
+
+/// Binds a deployed upgradeable program to the deployment the offline signer
+/// reviewed, by the slot it was last deployed in.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct AssertProgramDeploySlotArgs {
+    /// The program id under verification (must equal the passed account).
+    pub program: Pubkey,
+    /// The slot of the program's last deploy, upgrade or extend, as recorded
+    /// by the loader ("Last Deployed In Slot" in `solana program show`). Take
+    /// it from the same finalized ProgramData snapshot as the reviewed code.
+    pub expected_slot: u64,
 }
 
 /// Binds an arbitrary account to the exact state the offline signer reviewed.

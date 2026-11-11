@@ -141,6 +141,12 @@ async function main() {
     .accounts({ program: accts.program ?? args.program, programData: accts.programData ?? programData })
     .instruction();
   const wrongHash = sha256(Buffer.from("not the build"));
+  // "Last Deployed In Slot": the u64 after the ProgramData state tag.
+  const deploySlot = pdInfo.data.readBigUInt64LE(4);
+  const slotIx = (programKey, slot, accts = {}) => program.methods
+    .assertProgramDeploySlot({ program: programKey, expectedSlot: new anchor.BN(slot.toString()) })
+    .accounts({ program: accts.program ?? programKey, programData: accts.programData ?? programData })
+    .instruction();
 
   const cases = [
     // assert_account_hash
@@ -168,6 +174,16 @@ async function main() {
         ix: () => revisionIx({ program: programId, expectedHash: programHash }, { programData: squads.programData }),
       },
     ] : []),
+    // assert_program_deploy_slot
+    { label: `program deploy slot, honest (slot ${deploySlot})`, ix: () => slotIx(programId, deploySlot) },
+    { label: "program deploy slot, one slot later", expect: "ProgramDeploySlotMismatch", ix: () => slotIx(programId, deploySlot + 1n) },
+    { label: "program deploy slot, slot 0", expect: "ProgramDeploySlotMismatch", ix: () => slotIx(programId, 0n) },
+    { label: "program deploy slot, args/program mismatch", expect: "ProgramKeyMismatch", ix: () => slotIx(programId, deploySlot, { program: SQUADS_V4 }) },
+    { label: "program deploy slot, programdata passed as program", expect: "NotAProgram", ix: () => slotIx(programData, deploySlot) },
+    ...(squads ? [{
+      label: "program deploy slot, another program's programdata", expect: "ProgramDataAddressMismatch",
+      ix: () => slotIx(programId, deploySlot, { programData: squads.programData }),
+    }] : []),
     ...(closedProgram ? [{
       label: "program revision, closed program", expect: "InvalidProgramDataOwner",
       ix: async () => {

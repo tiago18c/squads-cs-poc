@@ -509,8 +509,22 @@ async function main() {
   const approveIx = (p) => multisig.instructions.proposalApprove({
     multisigPda: p.ms.multisigPda, transactionIndex: p.index, member: p.ms.member,
   });
-  /** The honest list: [assert_account_hash(multisig), verify_proposal_cpi, proposal_approve]. */
-  const honestList = async (p) => [await assertMultisigIx(p.ms), await verifyCpiIx(p), approveIx(p)];
+  /** assert_program_deploy_slot for `programKey`, with the slot read from chain:
+   *  pins the driver's current deployment from inside its own instruction list. */
+  const deploySlotIx = async (programKey) => {
+    const info = await connection.getAccountInfo(programKey);
+    const programData = new PublicKey(info.data.subarray(4, 36));
+    const slot = (await connection.getAccountInfo(programData)).data.readBigUInt64LE(4);
+    return program.methods
+      .assertProgramDeploySlot({ program: programKey, expectedSlot: new anchor.BN(slot.toString()) })
+      .accounts({ program: programKey, programData })
+      .instruction();
+  };
+  /** The honest list: [assert_account_hash(multisig), assert_program_deploy_slot(Vector),
+   *  verify_proposal_cpi, proposal_approve]. */
+  const honestList = async (p) => [
+    await assertMultisigIx(p.ms), await deploySlotIx(VECTOR_PROGRAM_ID), await verifyCpiIx(p), approveIx(p),
+  ];
 
   const fetchProposal = (p) => multisig.accounts.Proposal.fromAccountAddress(connection, p.proposal);
   /** Nothing may have changed: no vote on any of `proposals`, nonce not advanced. */

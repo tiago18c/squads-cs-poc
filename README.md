@@ -178,11 +178,12 @@ compute-unit limit on upgrade votes. Any mismatch aborts.
 so the clear-signing instructions sit in the same transaction as the vote without tripping the
 "nothing but the vote" rule.
 
-### Pinning other state: `assert_account_hash` and `assert_program_revision`
+### Pinning other state: the `assert_*` instructions
 
 `verify_proposal` binds *what the proposal does*; some proposals are only safe given *what other
-accounts contain* at vote time. Two standalone assertions let the signer pin that state too. Both
-take a 64-char lowercase-hex SHA-256 (`InvalidHashFormat`, 6037, otherwise) and abort on mismatch.
+accounts contain* at vote time. Three standalone assertions let the signer pin that state too. Each
+aborts on mismatch. The two hash checks take a 64-char lowercase-hex SHA-256 (`InvalidHashFormat`,
+6037, otherwise).
 
 **`assert_account_hash({ account, owner: Option<Pubkey>, expected_hash })`** — any account
 (the multisig's own config, a mint, an oracle, a program's config PDA):
@@ -213,7 +214,25 @@ The ProgramData metadata (deploy slot, upgrade authority) is excluded, so the di
 the build, not the deployment. Typical uses: confirm the build a proposal will interact with, or
 the currently deployed build before approving its upgrade.
 
-> **Vote-time only.** Like every check in this program, both assertions hold in the vote
+**`assert_program_deploy_slot({ program, expected_slot })`** — a cheap way to say "this program
+has not changed since I looked". It checks the program and ProgramData accounts exactly as
+`assert_program_revision` does (same codes 6041–6046), then compares the slot the loader records
+in the ProgramData account (`Last Deployed In Slot` in `solana program show`) with
+`expected_slot` (`ProgramDeploySlotMismatch`, 6058). It reads eight bytes where the revision
+check hashes the whole program, so its cost does not grow with program size.
+
+- **What a match means.** The loader sets the slot on every deploy, upgrade and extend, and
+  refuses a second change to the same program in the same slot. A matching slot therefore means
+  the program bytes are the ones written in that slot.
+- **What it does not mean.** It says nothing about what that code is. The signer must take the
+  slot and the reviewed code from the same finalized snapshot of the ProgramData account. Where
+  the device should show the build itself, use `assert_program_revision`.
+- **It can be made to fail.** Extending a program is permissionless and moves the slot, so anyone
+  can invalidate a pending vote that carries this assertion, for the rent on the added bytes. The
+  code is unchanged in that case; rebuild the vote with the new slot, or use
+  `assert_program_revision`, which ignores the added zero padding.
+
+> **Vote-time only.** Like every check in this program, these assertions hold in the vote
 > transaction, not at `vault_transaction_execute`. An account can change, and a program with a live
 > upgrade authority can be upgraded, between the vote and execution. Pinning is durable only for
 > state that can't change afterwards (e.g. an immutable program, or one whose upgrade authority is
@@ -374,8 +393,9 @@ list next to `verify_proposal_cpi`.
 - The checks rely on the deployed drivers behaving as their sources do today: `Submit` invokes
   exactly one executor instruction, the executor runs exactly the execution message, and Vector's
   `Passthrough` cannot be reached by CPI. An upgrade of a driver that changes this, or its layout,
-  would silently invalidate the checks. To pin the driver's build as well, put an
-  `assert_program_revision` for the driver program in the same embedded list.
+  would silently invalidate the checks. To pin the driver's deployment as well, put an
+  `assert_program_deploy_slot` (cheap) or `assert_program_revision` (hashes the build) for the
+  driver program in the same embedded list.
 
 ### The attack it stops
 
@@ -397,13 +417,13 @@ the chain (tx aborts) or show the truth (signer catches it).
   in the CPI path of the vote itself. A bug in it can cause false rejections, never a forged
   approval beyond what the signer already signed.
 - The offline device's policy must be: **only sign a transaction it can fully decode as
-  `[compute budget*, verify_buffer_hash?, (assert_account_hash | assert_program_revision)*, verify_proposal, proposal_approve]`** with this
+  `[compute budget*, verify_buffer_hash?, (assert_account_hash | assert_program_revision | assert_program_deploy_slot)*, verify_proposal, proposal_approve]`** with this
   program's known program ID, and render the args to the user. Everything else is enforced on-chain.
 - With a [programmatic signer](#programmatic-signers-verify_proposal_cpi) the device signs the
   driver's payload (the authorization message, or the transaction digest), not a transaction with
   a top-level vote. Its policy is the same, applied to the embedded list it decodes from what it
   signs: **sign only if that list is
-  `[verify_buffer_hash?, (assert_account_hash | assert_program_revision)*, verify_proposal_cpi, proposal_approve]`**
+  `[verify_buffer_hash?, (assert_account_hash | assert_program_revision | assert_program_deploy_slot)*, verify_proposal_cpi, proposal_approve]`**
   with this program's known program ID. The program locates the list itself, so the device has no
   location to check. Replay protection and expiry are the driver's.
 - The sysvar only exposes *top-level* instructions, which is why the shape check forbids unknown
@@ -424,6 +444,7 @@ the chain (tx aborts) or show the truth (signer catches it).
 | Upgrade buffer SHA-256 (when `verify_buffer_hash` is present) | |
 | Raw account data SHA-256 + optional owner (when `assert_account_hash` is present) | |
 | Program → ProgramData link + build SHA-256 (when `assert_program_revision` is present) | |
+| Program → ProgramData link + last deploy slot (when `assert_program_deploy_slot` is present) | |
 | `verify_proposal_cpi`: called via CPI directly by the driver, member signs, equals `args.member` and is not a transaction signer | Other top-level instructions that are not the Vector program's (`verify_proposal_cpi` only) |
 | `verify_proposal_cpi`: driver identity (the ed25519 signer's or Vector's program id) and its framing down to the executed list | Replay protection and expiry of the signed payload (the driver's nonce) |
 | `verify_proposal_cpi`: embedded list ends exactly, contains this invocation, holds only this program's instructions + the exact vote | Any driver other than these two (rejected), and later upgrades of the driver programs themselves |
@@ -494,11 +515,11 @@ transaction (`TransactionIndexMismatch`) — and finally submits the **honest** 
 bundled with `assert_account_hash` on the multisig account and `assert_program_revision` on this
 program) and executes the vault transaction.
 
-`run-e2e.sh` then runs `scripts/e2e-assert.cjs`: one-instruction cases for `assert_account_hash` /
-`assert_program_revision`, each checked on-chain. They cover the honest paths, including Squads v4
+`run-e2e.sh` then runs `scripts/e2e-assert.cjs`: one-instruction cases for `assert_account_hash`,
+`assert_program_revision` and `assert_program_deploy_slot`, each checked on-chain. They cover the honest paths, including Squads v4
 (a large, zero-padded ProgramData), and every failure code except `NotAProgramData` (6046). That
 one is defence in depth: across transactions, a loader-owned account at a Program's stored address
-is always its ProgramData; it could only differ within a transaction that also closes the program. The failure cases are wrong owner, wrong or malformed hash, args/account mismatch,
+is always its ProgramData; it could only differ within a transaction that also closes the program. The failure cases are wrong owner, wrong or malformed hash, wrong deploy slot, args/account mismatch,
 ProgramData passed as the program, a non-loader account, another program's ProgramData, and a
 closed program (a throwaway deploy, so the wallet needs about 3 SOL, refunded on close). The two
 Squads cases run only where Squads v4 exists (surfpool, devnet, mainnet).
@@ -754,13 +775,13 @@ vote: no Compute Budget instruction.
 
 ## Repo layout
 
-- `programs/squads-clear-signing/src/lib.rs` — entrypoint, accounts, IDL-visible arg types (`verify_proposal`, `verify_proposal_cpi`, `verify_buffer_hash`, `assert_account_hash`, `assert_program_revision`)
+- `programs/squads-clear-signing/src/lib.rs` — entrypoint, accounts, IDL-visible arg types (`verify_proposal`, `verify_proposal_cpi`, `verify_buffer_hash`, `assert_account_hash`, `assert_program_revision`, `assert_program_deploy_slot`)
 - `programs/squads-clear-signing/src/squads.rs` — mirrored Squads v4 layouts (VaultTransaction, Proposal header), discriminators
 - `programs/squads-clear-signing/src/validation.rs` — pure validation logic (message diff, ALT resolution, buffer/program/account hashing, top-level and embedded shape checks) + unit tests
 - `programs/squads-clear-signing/src/errors.rs` — granular failure codes
 - `programs/squads-clear-signing/tests/mainnet_fixture.rs` — decodes a real mainnet VaultTransaction
 - `scripts/e2e.cjs` / `run-e2e.sh` — simple system-transfer proposal, tampered vs honest approval
-- `scripts/e2e-assert.cjs` — on-chain cases for `assert_account_hash` / `assert_program_revision`
+- `scripts/e2e-assert.cjs` — on-chain cases for the `assert_*` instructions
 - `scripts/e2e-eps.cjs` — vote through the ed25519 programmatic signer on a local devnet fork
 - `scripts/e2e-vector.cjs` — vote through Vector on a local devnet fork
 - `scripts/e2e-super.sh` — full super-squads bundle (upgrade + verify + idl) with buffer-hash + v1
