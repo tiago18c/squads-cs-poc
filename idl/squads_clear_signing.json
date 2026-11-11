@@ -210,10 +210,10 @@
         "- the **ed25519 programmatic signer**: the top-level instruction is its",
         "`Submit`, and the list is the execution message handed to the",
         "message executor;",
-        "- **Vector**: the top-level instruction is a `Passthrough` of a known",
-        "Vector program that owns the member account, with the member as its",
-        "vector account. No other instruction of that program may appear in",
-        "the transaction except `Advance`.",
+        "- **Vector**: the top-level instruction is a `Passthrough` of the",
+        "Vector program, signing as the member (a vector account or its",
+        "system PDA). No other instruction of that program may appear in the",
+        "transaction except `Advance`.",
         "",
         "In both, the member must not be a transaction signer, and this",
         "instruction must be one the driver invokes directly.",
@@ -253,8 +253,8 @@
           "name": "member",
           "docs": [
             "The multisig member casting the vote: the programmatic signer, which",
-            "must sign this CPI (and equal `args.member`). For Vector, this is the",
-            "vector account, owned by its Vector program."
+            "must sign this CPI (and equal `args.member`). For Vector, this is a",
+            "vector account or its system PDA."
           ],
           "signer": true
         }

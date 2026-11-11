@@ -127,10 +127,10 @@ the driver never executes.
 |---|---|---|
 | Offline key signs | an authorization message (a v1 message whose one instruction carries the execution message) | a digest of the transaction's instruction list |
 | On-chain | top-level `Submit` verifies the signature and CPIs the executor, which CPIs each inner instruction; a relayer pays and submits | top-level `[Advance, Passthrough]`; `Passthrough` CPIs each sub-instruction |
-| Recognised by | the signer's program id; `Submit` must walk exactly to an `Execute` of the message executor | a known Vector program id that owns the member account; a `Passthrough` with the member as account 0 |
+| Recognised by | the signer's program id; `Submit` must walk exactly to an `Execute` of the message executor | Vector's program id; a `Passthrough` whose signers include the member |
 | Embedded list | the execution message | `Passthrough`'s data and accounts |
-| Member | PDA `["programmatic-signer", authority]` | PDA `["vector", identity]` |
-| Maturity | devnet only, not fully audited | not deployed on any cluster |
+| Member | PDA `["programmatic-signer", authority]` | a vector account, or its system PDA |
+| Maturity | devnet only, not fully audited | devnet only |
 
 - **Enforced on-chain:** the instruction is called via CPI, directly by the driver, with the
   member signing; the member does not sign the transaction itself; the top-level instruction is
@@ -143,8 +143,8 @@ the driver never executes.
   without the member's signature, which exists only inside the driver's CPI.
 - **The driver's concern:** replay protection (a nonce in both drivers) and expiry (neither has
   one). The checks hold at vote time only.
-- **Compiled in:** the program ids of the ed25519 signer, the message executor and the Vector
-  programs, and both wire layouts. A change to any of them needs an upgrade of this program, and
+- **Compiled in:** the program ids of the ed25519 signer, the message executor and Vector, and
+  both wire layouts. A change to any of them needs an upgrade of this program, and
   an upgrade of a driver that changes its behaviour would invalidate the checks. No other driver
   is accepted, and a program that wraps a driver is rejected.
 

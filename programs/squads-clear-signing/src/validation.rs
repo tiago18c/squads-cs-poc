@@ -1329,7 +1329,7 @@ mod tests {
 
     const OWN: &[u8] = b"verify-proposal-cpi-own-data";
 
-    /// (program, [(pubkey, is_signer)], data)
+    /// (program, accounts, data)
     type TestIx = (Pubkey, Vec<Pubkey>, Vec<u8>);
 
     fn embedded_self() -> TestIx {
@@ -1644,6 +1644,8 @@ mod tests {
         assert_eq!(check(&bad_signs, &metas), bad_driver);
         assert_eq!(check(&data, &metas[..1]), bad_driver);
         assert_eq!(check(&data[..2], &metas), bad_driver);
+        // Data ends right after the signs-as bytes: no instruction count.
+        assert_eq!(check(&data[..3], &metas), malformed);
         // Truncated data, missing accounts.
         assert_eq!(check(&data[..data.len() - 1], &metas), malformed);
         assert_eq!(check(&data, &metas[..metas.len() - 1]), malformed);
