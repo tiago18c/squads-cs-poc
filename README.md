@@ -225,6 +225,158 @@ chunks for a few CU each. Measured: ≈112k CU for this program (210 KB), ≈517
 (980 KB ELF in a 1.47 MB ProgramData). Raise the compute-unit limit accordingly; more than about
 2.5 MB of hashed bytes doesn't fit in a 1.4M CU transaction.
 
+### Programmatic signers: `verify_proposal_cpi`
+
+Everything above assumes the multisig member is the offline device's own key, signing the
+transaction that holds the vote. A member can instead be a **programmatic signer**: a PDA of a
+signer program, which signs only inside a CPI made by that program. The offline key then never
+signs a Solana transaction. It signs a payload defined by the signer program (the *driver*), and
+a relayer pays the fee and submits. The vote is no longer a top-level instruction, so
+`verify_proposal` cannot see it in the instructions sysvar, and would reject the driver's
+top-level instruction as `ForbiddenInstruction` anyway.
+
+`verify_proposal_cpi(args: VerifyProposalArgs)` covers this case. It runs the same content diff
+as `verify_proposal` (same args, same accounts plus the member, same error codes). In place of
+the top-level shape check, it loads the top-level instruction this CPI descends from, recognises
+the driver from it, parses that driver's framing from the first byte of the instruction data to
+reach the instruction list the driver executes, and applies the shape rule to that list.
+
+There is no location argument. A location chosen by whoever builds the payload can be aimed at
+bytes that parse as a valid list but that the driver never executes: an address table, another
+instruction's data, the data of a wrapping program's instruction.
+
+Two drivers are recognised; a top-level instruction of any other program fails with
+`UnsupportedSignerDriver` (6050). That includes a program that wraps a driver: the driver's
+instruction must itself be top-level. Neither driver is production-ready: both are deployed on
+devnet only, and the first is described by its authors as not fully audited.
+
+**[ed25519 programmatic signer](https://github.com/solana-program/ed25519-programmatic-signer)**
+(`EdSigVfK1DkeMrjFNDMjwfQaJPhPTtX7jW8uPv3oKEgN`).
+The offline key ed25519-signs an *authorization message*: a Solana v1 message (SIMD-0385) with one
+instruction, the Message Executor's `Execute`, whose data carries an *execution message* (another
+v1 message) holding the inner instructions. `Submit` verifies the signature in-program and CPIs
+`Execute` with the PDA `["programmatic-signer", authority]` as signer; the executor advances a
+nonce and CPIs each inner instruction.
+
+```
+relayed tx (fee payer: relayer)
+└─ Ed25519 Signer :: Submit(signatures, authorization message)       ← top level
+   └─ Message Executor :: Execute(execution message)                 ← CPI, PDA signs
+      ├─ squads_clear_signing::assert_*(...)*                        ← CPI, optional
+      ├─ squads_clear_signing::verify_proposal_cpi(content)
+      └─ squads_multisig_program::proposal_approve(member = PDA)
+```
+
+This driver is recognised by the top-level instruction's program id. The `Submit` data is walked
+from byte 0 and must be consumed exactly:
+
+- the `Submit` discriminator (`0x00`), then the signature vector: a count, then per entry `0x00`
+  or `0x01` followed by a 64-byte signature;
+- the authorization message: a v1 message (`0x81` prefix, zero config mask) with exactly one
+  instruction, whose program is the Message Executor
+  (`ExecxgyHYsAXB4c5dZodV1zJZ9hqfsDCYkRDRATrpkFR`) and whose data runs to the end of the `Submit`
+  data;
+- that instruction's data: the `Execute` discriminator (`0x00`), then the execution message.
+
+The execution message is the embedded list. It is a v1 message with a zero config mask. Program
+ids and accounts are indexes into its own address table, and an account is a signer iff its index
+is below `num_required_signatures`, so the member PDA must be in the message's signer region.
+
+The rest of the transaction is not restricted in this mode: the member PDA signs only inside a
+`Submit`'s execution, and every `Submit` needs its own signed authorization message.
+
+**[Vector](https://github.com/tiago18c/vector)** (`74mXFW7BSAAwc6zQC2uYKuDcWnz17HHXMWqLnEeg9BJv`,
+one program for every signature scheme; branch `feat/single-program`, deployed on devnet). The
+transaction is `[Advance, Passthrough]`, both top-level. The off-chain key signs a digest of the
+whole transaction, which `Advance` verifies. `Passthrough` then invokes each sub-instruction,
+signing as one or more vector accounts: each either as itself, PDA
+`["vector", [scheme], sha256(key)]`, or as its system PDA, `[vector address]`, which is owned by
+the System program. The multisig member can be either address.
+
+```
+tx = [ Vector :: Advance(signatures),                                ← top level
+       Vector :: Passthrough(signers, { num_accounts, data_len, data }*) ]   ← top level
+         ├─ squads_clear_signing::verify_proposal_cpi(content)
+         └─ squads_multisig_program::proposal_approve(member = PDA)  ← CPIs, PDA signs
+```
+
+This driver is recognised by the top-level instruction's program id. The instruction must be a
+`Passthrough` (discriminator `0x01`), and the embedded list is read from its layout:
+
+- data: `0x01`, a signer count, one byte per signer (`0` signs as the vector account, `1` as its
+  system PDA), a `count` byte, then per sub-instruction `{ num_accounts: u8, data_len: u16 LE, data }`;
+- accounts: the instructions sysvar, the signers' vector accounts, then per sub-instruction its
+  program followed by its `num_accounts` accounts.
+
+The program does not look for the member among the signers. The member signs this CPI without
+signing the transaction, and the CPI is made directly by the `Passthrough`, so the signature can
+only come from that `Passthrough`: the member is one of the addresses it signs as. For the same
+reason the member's account in the embedded vote is counted as a signer, although the top-level
+account flags, which describe the transaction and not the CPI, say otherwise.
+
+An `Advance` authorizes every later `Passthrough` in the transaction that names its accounts, so
+every other top-level instruction of the Vector program must be an `Advance` (discriminator
+`0x00`). A second `Passthrough` could use the member's signature outside the checked list. The
+rule is an allow-list, so it also rejects harmless ones, such as an `Initialize` in the same
+transaction.
+
+#### What the chain enforces
+
+1. **Invoked via CPI** — a top-level call fails with `NotInvokedViaCpi` (6048).
+2. **The member signs** — the `member` account must sign the CPI (Anchor's `AccountNotSigner`,
+   3010, otherwise) and equal `args.member` (`MemberAccountMismatch`, 6049).
+3. **Content diff** — identical to `verify_proposal`.
+4. **The member is a programmatic signer** — it must not be a signer of the transaction
+   (`MemberIsTransactionSigner`, 6056). Both drivers forward real transaction signers into their
+   CPIs, and a key that signs the transaction could also vote from any other top-level
+   instruction.
+5. **Driver** — the top-level instruction this CPI descends from belongs to the ed25519 signer
+   program or to the Vector program (`UnsupportedSignerDriver`, 6050), and has that driver's
+   layout: a `Submit` that walks exactly to an `Execute` of the Message Executor, or a
+   `Passthrough` with a well-formed signer list (`MalformedDriverInstruction`, 6051).
+6. **Vector siblings** — in the Vector mode, every other top-level instruction of the same
+   program is an `Advance` (`ForbiddenDriverInstruction`, 6055).
+7. **List framing** — the embedded list must parse: bounds, the `0x81` prefix, zero config mask,
+   resolvable account indexes (`MalformedEmbeddedInstructions`, 6052). It must end exactly: an
+   execution message at its last byte, a `Passthrough` list at the end of both the data and the
+   account list (`EmbeddedTrailingBytes`, 6053).
+8. **Contains this invocation** — one instruction in the list must target this program with data
+   equal, byte for byte, to this invocation's discriminator and `args`
+   (`EmbeddedSelfInstructionMissing`, 6054).
+9. **Shape** — every instruction in the list is either this program's or the exact expected vote,
+   with at least one vote. Compute Budget instructions are accepted at top level by
+   `verify_proposal` only, not inside an embedded list. The codes are reused:
+   `ForbiddenInstruction` (6022), `UnexpectedSquadsInstruction` (6023),
+   `MalformedVoteInstruction` (6024), `VoteMultisigMismatch` (6025), `VoteProposalMismatch` (6026),
+   `VoteMemberMismatch` (6027), `VoteMemberNotSigner` (6028), `MissingVoteInstruction` (6029).
+10. **Invoked by the driver directly** — the instruction runs at the depth at which the driver
+    invokes its listed instructions: 3 under the ed25519 signer, 2 under Vector
+    (`UnexpectedStackHeight`, 6057).
+
+`verify_buffer_hash`, `assert_account_hash` and `assert_program_revision` never look at the
+top-level instructions, so they work unchanged when called via CPI and can sit in the embedded
+list next to `verify_proposal_cpi`.
+
+#### What the chain does not enforce
+
+- **Other top-level instructions** that are not the Vector program's. They run without the
+  member's signature, which exists only inside the driver's CPI.
+- **Replay and expiry.** These belong to the driver. Both drivers use a nonce and neither has a
+  built-in expiry, so a signed payload stays valid until its nonce is consumed. As everywhere in
+  this program, the checks hold at vote time only.
+- **Any other driver.** A member behind a different signer program cannot use this instruction.
+
+#### Compiled-in assumptions
+
+- The program ids of the ed25519 signer, the Message Executor and Vector, and the wire layouts of
+  both drivers, are compiled into this program. A change to any of them needs an upgrade of this
+  program.
+- The checks rely on the deployed drivers behaving as their sources do today: `Submit` invokes
+  exactly one executor instruction, the executor runs exactly the execution message, and Vector's
+  `Passthrough` cannot be reached by CPI. An upgrade of a driver that changes this, or its layout,
+  would silently invalidate the checks. To pin the driver's build as well, put an
+  `assert_program_revision` for the driver program in the same embedded list.
+
 ### The attack it stops
 
 | Scenario | Before (offline, stage 2) | With this program |
@@ -247,6 +399,13 @@ the chain (tx aborts) or show the truth (signer catches it).
 - The offline device's policy must be: **only sign a transaction it can fully decode as
   `[compute budget*, verify_buffer_hash?, (assert_account_hash | assert_program_revision)*, verify_proposal, proposal_approve]`** with this
   program's known program ID, and render the args to the user. Everything else is enforced on-chain.
+- With a [programmatic signer](#programmatic-signers-verify_proposal_cpi) the device signs the
+  driver's payload (the authorization message, or the transaction digest), not a transaction with
+  a top-level vote. Its policy is the same, applied to the embedded list it decodes from what it
+  signs: **sign only if that list is
+  `[verify_buffer_hash?, (assert_account_hash | assert_program_revision)*, verify_proposal_cpi, proposal_approve]`**
+  with this program's known program ID. The program locates the list itself, so the device has no
+  location to check. Replay protection and expiry are the driver's.
 - The sysvar only exposes *top-level* instructions, which is why the shape check forbids unknown
   programs outright: a foreign instruction could otherwise CPI into Squads (with the member's
   signer privilege) invisibly.
@@ -265,6 +424,10 @@ the chain (tx aborts) or show the truth (signer catches it).
 | Upgrade buffer SHA-256 (when `verify_buffer_hash` is present) | |
 | Raw account data SHA-256 + optional owner (when `assert_account_hash` is present) | |
 | Program → ProgramData link + build SHA-256 (when `assert_program_revision` is present) | |
+| `verify_proposal_cpi`: called via CPI directly by the driver, member signs, equals `args.member` and is not a transaction signer | Other top-level instructions that are not the Vector program's (`verify_proposal_cpi` only) |
+| `verify_proposal_cpi`: driver identity (the ed25519 signer's or Vector's program id) and its framing down to the executed list | Replay protection and expiry of the signed payload (the driver's nonce) |
+| `verify_proposal_cpi`: embedded list ends exactly, contains this invocation, holds only this program's instructions + the exact vote | Any driver other than these two (rejected), and later upgrades of the driver programs themselves |
+| `verify_proposal_cpi`, Vector: every other top-level instruction of the Vector program is an `Advance` | |
 
 ## Status & limitations
 
@@ -279,6 +442,11 @@ the chain (tx aborts) or show the truth (signer catches it).
   supported (the discriminator check will correctly refuse them); a `verify_config_proposal`
   twin covering `ConfigAction`s is the natural extension, and arguably even more important
   (config changes rotate keys/thresholds).
+- **Programmatic signers** — `verify_proposal_cpi` supports two drivers (end-to-end tests:
+  [below](#end-to-end-programmatic-signers)), and neither is production-ready: both are
+  deployed on devnet only, and the ed25519 programmatic signer is not fully audited. Their wire
+  layouts and program ids are compiled in, so a change
+  to either needs an upgrade of this program.
 - `proposal_activate` in the same transaction (draft flows) is currently disallowed by the
   strict shape check.
 - The Squads v4 layouts are mirrored (verified against the published source) rather than
@@ -381,6 +549,62 @@ NETWORK=devnet DEPLOYER_KEYPAIR=<funded> scripts/e2e-super.sh   # live devnet
 It needs **no** `solana-verify` binary — `scripts/program-hash.cjs` reproduces the sha256 digest
 (matching `solana-verify get-program-hash`/`get-buffer-hash`, which is also what
 `verify_buffer_hash` checks) directly from account data or a local `.so`.
+
+## End-to-end: programmatic signers
+
+`scripts/e2e-eps.cjs` votes through the ed25519 programmatic signer on a local devnet fork;
+`scripts/e2e-vector.cjs` votes through Vector on a local devnet fork.
+
+Both run against a local fork only (they refuse any non-local RPC), with the clear-signing
+program deployed from `target/deploy/`. Each expected failure is checked on-chain by its error
+code and by the absence of a vote; the driver's nonce must be unchanged.
+
+**ed25519 programmatic signer** — `scripts/e2e-eps.cjs`, on a fork of devnet (which has the
+signer, executor and nonce programs):
+
+```bash
+surfpool start --network devnet --no-tui --no-deploy --no-studio -y    # terminal 1
+solana airdrop 100 -u http://127.0.0.1:8899 -k keys/e2e-wallet.json
+solana program extend 7xs3LhQjKoCGfXm2qst7LUhismrG1bGxz5Jw6AHij7eu 80000 -u http://127.0.0.1:8899 -k keys/e2e-wallet.json
+solana program deploy target/deploy/squads_clear_signing.so \
+  --program-id target/deploy/squads_clear_signing-keypair.json -u http://127.0.0.1:8899 -k keys/e2e-wallet.json
+node scripts/e2e-eps.cjs
+```
+
+| Case | Result |
+|---|---|
+| Expected data differs from the stored vault transaction | `DataMismatch` (6020) |
+| Proposal #1 verified, vote cast on proposal #2 | `VoteProposalMismatch` (6026) |
+| Extra instruction of another program (Memo) in the execution message | `ForbiddenInstruction` (6022) |
+| `verify_proposal` used in place of `verify_proposal_cpi` | `ForbiddenInstruction` (6022) |
+| `verify_proposal_cpi` as a top-level instruction | `NotInvokedViaCpi` (6048) |
+| `[assert_account_hash, verify_proposal_cpi, proposal_approve]` | vote lands, about 127k CU |
+
+The relayed transaction is 1,730 bytes, so it needs a v1 (4 KB) transaction: the authorization
+message repeats every account key inline, which a lookup table cannot shrink.
+
+**Vector** — `scripts/e2e-vector.cjs`, also on a fork of devnet, where Vector is deployed. It
+defaults to port 8999, so point it at the same fork:
+
+```bash
+RPC_URL=http://127.0.0.1:8899 node scripts/e2e-vector.cjs
+```
+
+| Case | Result |
+|---|---|
+| Expected data differs from the stored vault transaction | `DataMismatch` (6020) |
+| Proposal #1 verified, vote cast on proposal #2 | `VoteProposalMismatch` (6026) |
+| One stray byte after the sub-instruction list | `EmbeddedTrailingBytes` (6053) |
+| Extra System transfer sub-instruction | `ForbiddenInstruction` (6022) |
+| `verify_proposal_cpi` as a top-level instruction | `NotInvokedViaCpi` (6048) |
+| A second `Passthrough` voting on proposal #2, after or before the verified one | `ForbiddenDriverInstruction` (6055) |
+| `[Advance, Passthrough{assert_account_hash, verify_proposal_cpi, proposal_approve}]`, member = vector account | vote lands, about 49k CU, 847 bytes (legacy transaction) |
+| The same with Compute Budget instructions at top level | vote lands |
+| Member = a vector account's system PDA: vote on the wrong proposal, then the honest vote | `VoteProposalMismatch` (6026), then the vote lands |
+| Two signers in one `Advance` and `Passthrough`, one of them the member, in either order | vote lands, about 63k CU |
+
+Not covered by either script: malformed driver framing, a member that signs the transaction, and
+votes other than approve. The parsers' framing rules are unit-tested with hand-built fixtures.
 
 ## Approving an existing proposal
 
@@ -513,15 +737,32 @@ await program.methods
   .instruction();
 ```
 
+For a programmatic signer, build `verify_proposal_cpi` with the same args, and place it and the
+vote in the driver's embedded list instead of the transaction:
+
+```js
+await program.methods
+  .verifyProposalCpi(args)
+  .accounts({ proposal: proposalPda, transaction: txPda,
+              instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY, member: memberPda })
+  .remainingAccounts(/* lookup tables, as above */)
+  .instruction();
+```
+
+`args.member` is the PDA. The embedded list may hold only this program's instructions and the
+vote: no Compute Budget instruction.
+
 ## Repo layout
 
-- `programs/squads-clear-signing/src/lib.rs` — entrypoint, accounts, IDL-visible arg types (`verify_proposal`, `verify_buffer_hash`, `assert_account_hash`, `assert_program_revision`)
+- `programs/squads-clear-signing/src/lib.rs` — entrypoint, accounts, IDL-visible arg types (`verify_proposal`, `verify_proposal_cpi`, `verify_buffer_hash`, `assert_account_hash`, `assert_program_revision`)
 - `programs/squads-clear-signing/src/squads.rs` — mirrored Squads v4 layouts (VaultTransaction, Proposal header), discriminators
-- `programs/squads-clear-signing/src/validation.rs` — pure validation logic (message diff, ALT resolution, buffer/program/account hashing) + unit tests
+- `programs/squads-clear-signing/src/validation.rs` — pure validation logic (message diff, ALT resolution, buffer/program/account hashing, top-level and embedded shape checks) + unit tests
 - `programs/squads-clear-signing/src/errors.rs` — granular failure codes
 - `programs/squads-clear-signing/tests/mainnet_fixture.rs` — decodes a real mainnet VaultTransaction
 - `scripts/e2e.cjs` / `run-e2e.sh` — simple system-transfer proposal, tampered vs honest approval
 - `scripts/e2e-assert.cjs` — on-chain cases for `assert_account_hash` / `assert_program_revision`
+- `scripts/e2e-eps.cjs` — vote through the ed25519 programmatic signer on a local devnet fork
+- `scripts/e2e-vector.cjs` — vote through Vector on a local devnet fork
 - `scripts/e2e-super.sh` — full super-squads bundle (upgrade + verify + idl) with buffer-hash + v1
 - `scripts/approve-clearsign.cjs` — reusable clear-signed approval builder, legacy tx (+ tamper modes)
 - `scripts/approve-clearsign-v1.cjs` — kit-based clear-signed approval as a v1 (4 KB) transaction

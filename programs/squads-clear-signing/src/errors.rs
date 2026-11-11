@@ -101,4 +101,25 @@ pub enum ClearSigningError {
     NotAProgramData,
     #[msg("Program bytes do not hash to the expected value")]
     ProgramHashMismatch,
+    // --- verify_proposal_cpi (6048+) ---
+    #[msg("verify_proposal_cpi must be invoked via CPI, not as a top-level instruction")]
+    NotInvokedViaCpi,
+    #[msg("Member account does not match the member in the args")]
+    MemberAccountMismatch,
+    #[msg("The top-level instruction is not a supported programmatic-signer driver for this member")]
+    UnsupportedSignerDriver,
+    #[msg("The driver's top-level instruction does not have the expected layout")]
+    MalformedDriverInstruction,
+    #[msg("The driver's embedded instruction list is malformed or out of bounds")]
+    MalformedEmbeddedInstructions,
+    #[msg("The driver's embedded instruction list has trailing bytes or accounts")]
+    EmbeddedTrailingBytes,
+    #[msg("The driver's embedded instruction list does not contain this verify_proposal_cpi instruction")]
+    EmbeddedSelfInstructionMissing,
+    #[msg("Another instruction of the driver program in this transaction could use the member's signature")]
+    ForbiddenDriverInstruction,
+    #[msg("Member signs the transaction itself; verify_proposal_cpi is for programmatic signers only")]
+    MemberIsTransactionSigner,
+    #[msg("verify_proposal_cpi was not invoked directly by the driver")]
+    UnexpectedStackHeight,
 }

@@ -112,6 +112,46 @@ flowchart LR
 - **State pins** (optional): `assert_account_hash` pins any account's raw data (and optionally its owner); `assert_program_revision` pins a deployed program's build, following the program account to its ProgramData and matching `solana-verify get-program-hash`.
 - **The companion program can only abort.** It holds no authority and isn't in the CPI path of the vote. The worst a bug can do is reject a valid vote. It can't forge one.
 
+### Programmatic signers
+
+The flow above has the offline key sign the transaction that holds the vote. A multisig member
+can instead be a **programmatic signer**: a PDA of a signer program (the *driver*) that signs
+only inside a CPI. The vote is then not a top-level instruction, and `verify_proposal` cannot
+see it. `verify_proposal_cpi` runs the same content diff and checks the instruction list the
+driver executes instead. It takes no location: it recognises the driver from the top-level
+instruction the CPI descends from and parses that driver's framing to reach the list. A location
+supplied by whoever builds the payload could point at bytes that parse as a valid list but that
+the driver never executes.
+
+| | ed25519 programmatic signer | Vector |
+|---|---|---|
+| Offline key signs | an authorization message (a v1 message whose one instruction carries the execution message) | a digest of the transaction's instruction list |
+| On-chain | top-level `Submit` verifies the signature and CPIs the executor, which CPIs each inner instruction; a relayer pays and submits | top-level `[Advance, Passthrough]`; `Passthrough` CPIs each sub-instruction |
+| Recognised by | the signer's program id; `Submit` must walk exactly to an `Execute` of the message executor | Vector's program id; a `Passthrough` whose signers include the member |
+| Embedded list | the execution message | `Passthrough`'s data and accounts |
+| Member | PDA `["programmatic-signer", authority]` | a vector account, or its system PDA |
+| Maturity | devnet only, not fully audited | devnet only |
+
+- **Enforced on-chain:** the instruction is called via CPI, directly by the driver, with the
+  member signing; the member does not sign the transaction itself; the top-level instruction is
+  one of the two drivers and has its layout; the list it executes ends
+  exactly, contains this exact `verify_proposal_cpi` invocation, and otherwise holds only this
+  program's instructions and the expected vote (no Compute Budget). With Vector, every other
+  top-level instruction of the Vector program must be an `Advance`, because one `Advance`
+  authorizes every later `Passthrough` in the transaction.
+- **Not restricted:** other top-level instructions that are not the Vector program's. They run
+  without the member's signature, which exists only inside the driver's CPI.
+- **The driver's concern:** replay protection (a nonce in both drivers) and expiry (neither has
+  one). The checks hold at vote time only.
+- **Compiled in:** the program ids of the ed25519 signer, the message executor and Vector, and
+  both wire layouts. A change to any of them needs an upgrade of this program, and
+  an upgrade of a driver that changes its behaviour would invalidate the checks. No other driver
+  is accepted, and a program that wraps a driver is rejected.
+
+Given the drivers' maturity this is not production guidance. Details and error codes are in the
+[README](../README.md#programmatic-signers-verify_proposal_cpi), the end-to-end tests
+[here](../README.md#end-to-end-programmatic-signers).
+
 ---
 
 ## 5. The attack it stops
@@ -131,4 +171,4 @@ A dishonest coordinator has two options. It can show data that doesn't match the
 - **Validated on devnet** against live Squads v4, otter-verify and program-metadata. This covers a bundled *upgrade + verify-build + IDL* proposal (both tamper cases abort; the honest approval executes).
 - **Size:** content is duplicated into the approval tx. Larger bundles use **v1 (4 KB) transactions** (about 1.8 KB for the 5-instruction bundle). A hash-commitment mode could lift the limit further.
 - **Scope:** only `VaultTransaction` proposals. `ConfigTransaction` (key/threshold changes) and `Batch` need a sibling `verify_config_proposal`.
-- **Device policy required:** sign only `[compute budget*, verify_buffer_hash?, (assert_account_hash | assert_program_revision)*, verify_proposal, proposal_approve]` using the known program ID.
+- **Device policy required:** sign only `[compute budget*, verify_buffer_hash?, (assert_account_hash | assert_program_revision)*, verify_proposal, proposal_approve]` using the known program ID. With a programmatic signer, the device signs the driver's payload and applies the same rule to the list it decodes from that payload: sign only if it is `[verify_buffer_hash?, (assert_account_hash | assert_program_revision)*, verify_proposal_cpi, proposal_approve]`. The program locates the list itself, so there is no location for the device to check.
