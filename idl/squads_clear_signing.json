@@ -94,6 +94,105 @@
           }
         }
       ]
+    },
+    {
+      "name": "assert_account_hash",
+      "docs": [
+        "Assert that an arbitrary account's raw data hashes to",
+        "`args.expected_hash` (SHA-256 over the **untrimmed** account data, as",
+        "lowercase hex), and \u2014 when `args.owner` is `Some` \u2014 that the account is",
+        "owned by that program. Lets an offline signer pin the exact state of",
+        "any account a proposal depends on (a config, a mint, an oracle, ...)",
+        "**at vote time**. Only data and (optionally) owner are covered \u2014 not",
+        "lamports or the executable flag; a non-existent account has empty data",
+        "and the system program as owner. Aborts the transaction on any mismatch."
+      ],
+      "discriminator": [
+        49,
+        167,
+        81,
+        118,
+        243,
+        109,
+        225,
+        201
+      ],
+      "accounts": [
+        {
+          "name": "account",
+          "docs": [
+            "The account whose data (and optionally owner) is asserted."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "args",
+          "type": {
+            "defined": {
+              "name": "AssertAccountHashArgs"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "assert_program_revision",
+      "docs": [
+        "Assert that a deployed loader-v3 program runs exactly the build hashing",
+        "to `args.expected_hash`. A specialization of `assert_account_hash` for",
+        "upgradeable programs, which keep their code in a separate ProgramData",
+        "account:",
+        "",
+        "1. the `program` account equals `args.program`, is owned by the BPF",
+        "upgradeable loader, and is in the `Program` state;",
+        "2. the `programdata_address` stored in it equals the passed",
+        "`program_data` account, which is also loader-owned and in the",
+        "`ProgramData` state;",
+        "3. the ProgramData's program bytes (trailing zeros trimmed) SHA-256 to",
+        "`args.expected_hash` \u2014 byte-identical to",
+        "`solana-verify get-program-hash <program>`.",
+        "",
+        "The ProgramData metadata (deploy slot, upgrade authority) is not part",
+        "of the hash, so the digest identifies the build, not the deployment.",
+        "Like every assertion here it holds at vote time only: a program with",
+        "a live upgrade authority can change before the proposal executes."
+      ],
+      "discriminator": [
+        138,
+        183,
+        227,
+        253,
+        106,
+        7,
+        109,
+        162
+      ],
+      "accounts": [
+        {
+          "name": "program",
+          "docs": [
+            "The loader-v3 Program account (the program id)."
+          ]
+        },
+        {
+          "name": "program_data",
+          "docs": [
+            "The ProgramData account the program account points at.",
+            "`ProgramData` state, and program-bytes hash are validated in the handler."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "args",
+          "type": {
+            "defined": {
+              "name": "AssertProgramRevisionArgs"
+            }
+          }
+        }
+      ]
     }
   ],
   "types": [
@@ -279,6 +378,70 @@
                 }
               }
             }
+          }
+        ]
+      }
+    },
+    {
+      "name": "AssertAccountHashArgs",
+      "docs": [
+        "Binds an arbitrary account to the exact state the offline signer reviewed."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "account",
+            "docs": [
+              "The account under verification (must equal the passed account \u2014",
+              "duplicated here so the offline device renders it from the args alone)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "owner",
+            "docs": [
+              "If set, the program that must own the account."
+            ],
+            "type": {
+              "option": "pubkey"
+            }
+          },
+          {
+            "name": "expected_hash",
+            "docs": [
+              "SHA-256 of the account's raw data (no trimming), as a **lowercase hex",
+              "string** (64 chars)."
+            ],
+            "type": "string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AssertProgramRevisionArgs",
+      "docs": [
+        "Binds a deployed upgradeable program to the exact build the offline",
+        "signer reviewed."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "program",
+            "docs": [
+              "The program id under verification (must equal the passed account)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "expected_hash",
+            "docs": [
+              "SHA-256 of the ProgramData's program bytes with trailing zeros",
+              "trimmed, as a **lowercase hex string** (64 chars) \u2014 byte-identical to",
+              "`solana-verify get-program-hash <program>`."
+            ],
+            "type": "string"
           }
         ]
       }
@@ -469,6 +632,61 @@
       "code": 6036,
       "name": "ProposalIndexMismatch",
       "msg": "Proposal.transaction_index does not match the expected transaction_index"
+    },
+    {
+      "code": 6037,
+      "name": "InvalidHashFormat",
+      "msg": "Expected hash is not a 64-char lowercase hex string"
+    },
+    {
+      "code": 6038,
+      "name": "AssertedAccountMismatch",
+      "msg": "Account does not match the address in the args"
+    },
+    {
+      "code": 6039,
+      "name": "AccountOwnerMismatch",
+      "msg": "Account owner does not match the expected owner"
+    },
+    {
+      "code": 6040,
+      "name": "AccountHashMismatch",
+      "msg": "Account data does not hash to the expected value"
+    },
+    {
+      "code": 6041,
+      "name": "ProgramKeyMismatch",
+      "msg": "Program account does not match the address in the args"
+    },
+    {
+      "code": 6042,
+      "name": "InvalidProgramOwner",
+      "msg": "Program account is not owned by the BPF upgradeable loader"
+    },
+    {
+      "code": 6043,
+      "name": "NotAProgram",
+      "msg": "Account is not a BPF upgradeable loader Program"
+    },
+    {
+      "code": 6044,
+      "name": "ProgramDataAddressMismatch",
+      "msg": "ProgramData account does not match the address stored in the Program account"
+    },
+    {
+      "code": 6045,
+      "name": "InvalidProgramDataOwner",
+      "msg": "ProgramData account is not owned by the BPF upgradeable loader"
+    },
+    {
+      "code": 6046,
+      "name": "NotAProgramData",
+      "msg": "Account is not a BPF upgradeable loader ProgramData"
+    },
+    {
+      "code": 6047,
+      "name": "ProgramHashMismatch",
+      "msg": "Program bytes do not hash to the expected value"
     }
   ]
 }

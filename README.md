@@ -84,6 +84,7 @@ The wallet prepends instructions from this program to the same transaction as th
 
 ```
 tx = [ squads_clear_signing::verify_buffer_hash(buffer, sha256-hex),  ← program upgrades only
+       squads_clear_signing::assert_*(...)*,                          ← optional state pins (below)
        squads_clear_signing::verify_proposal(expected_content),       ← decodable offline via IDL
        squads_multisig_program::proposal_approve(...) ]
 ```
@@ -165,16 +166,64 @@ loader-v3 owner and `Buffer` state tag, extracts the program bytes, and hashes t
 exact convention (and exact digest) of `solana-verify get-buffer-hash`. `expected_hash` is a
 **lowercase-hex `String` (64 chars)** — not a raw byte array — so the offline device renders the
 *human-readable digest* the signer compares against `solana-verify`, instead of opaque numbers.
-On-chain the program hex-decodes it (rejecting wrong length / non-hex) and compares bytes; both the
-hash (a few hundred CU) and the hex parse are negligible. Any mismatch aborts.
+On-chain the program hex-decodes it (rejecting wrong length / non-hex) and compares bytes. Hashing
+costs about 0.5 CU per trimmed program byte (≈500k CU for a 1 MB build), so wallets should raise the
+compute-unit limit on upgrade votes. Any mismatch aborts.
 
 > Earlier iterations hashed with `brine-ed25519`, which only offers SHA-512 — a valid commitment,
 > but **not** the digest `solana-verify` prints (SHA-256). Switching to the native SHA-256 syscall
 > makes the displayed hash directly comparable to `solana-verify get-buffer-hash` and is ~1000× cheaper.
 
 `verify_proposal`'s transaction-shape check whitelists this program (and the ComputeBudget program),
-so the two clear-signing instructions sit in the same transaction as the vote without tripping the
+so the clear-signing instructions sit in the same transaction as the vote without tripping the
 "nothing but the vote" rule.
+
+### Pinning other state: `assert_account_hash` and `assert_program_revision`
+
+`verify_proposal` binds *what the proposal does*; some proposals are only safe given *what other
+accounts contain* at vote time. Two standalone assertions let the signer pin that state too. Both
+take a 64-char lowercase-hex SHA-256 (`InvalidHashFormat`, 6037, otherwise) and abort on mismatch.
+
+**`assert_account_hash({ account, owner: Option<Pubkey>, expected_hash })`** — any account
+(the multisig's own config, a mint, an oracle, a program's config PDA):
+
+1. the passed account equals `args.account` (`AssertedAccountMismatch`, 6038);
+2. if `owner` is `Some`, the account's owner equals it (`AccountOwnerMismatch`, 6039) — pass it
+   whenever the data is only meaningful under a specific program;
+3. `sha256(account.data)` over the **raw, untrimmed** data equals `expected_hash`
+   (`AccountHashMismatch`, 6040). Unlike program hashes, trailing zeros are significant for
+   account state, so nothing is trimmed. Off-chain: `sha256(getAccountInfo(account).data)`.
+
+Only data and (optionally) owner are covered — not lamports or the executable flag. A missing
+account has empty data and the system program as owner, so it passes with `sha256("")` unless
+`owner` excludes that.
+
+**`assert_program_revision({ program, expected_hash })`** — the specialization for a deployed
+loader-v3 program, whose code lives in a separate ProgramData account:
+
+1. the `program` account equals `args.program` (`ProgramKeyMismatch`, 6041), is owned by the BPF
+   upgradeable loader (`InvalidProgramOwner`, 6042), and is in the `Program` state (`NotAProgram`, 6043);
+2. the `programdata_address` stored *in* the program account equals the passed `program_data`
+   account (`ProgramDataAddressMismatch`, 6044), which is loader-owned (`InvalidProgramDataOwner`,
+   6045) and in the `ProgramData` state (`NotAProgramData`, 6046);
+3. the ProgramData's program bytes, trailing zeros trimmed, SHA-256 to `expected_hash`
+   (`ProgramHashMismatch`, 6047) — byte-identical to `solana-verify get-program-hash <program>`.
+
+The ProgramData metadata (deploy slot, upgrade authority) is excluded, so the digest identifies
+the build, not the deployment. Typical uses: confirm the build a proposal will interact with, or
+the currently deployed build before approving its upgrade.
+
+> **Vote-time only.** Like every check in this program, both assertions hold in the vote
+> transaction, not at `vault_transaction_execute`. An account can change, and a program with a live
+> upgrade authority can be upgraded, between the vote and execution. Pinning is durable only for
+> state that can't change afterwards (e.g. an immutable program, or one whose upgrade authority is
+> this multisig's own vault).
+
+Cost: hashing uses the `sol_sha256` syscall at about **0.5 CU per hashed byte**. For programs that's
+the trimmed ELF size, not the ProgramData allocation: zero padding is skipped in 4 KB `sol_memcmp`
+chunks for a few CU each. Measured: ≈112k CU for this program (210 KB), ≈517k CU for Squads v4
+(980 KB ELF in a 1.47 MB ProgramData). Raise the compute-unit limit accordingly; more than about
+2.5 MB of hashed bytes doesn't fit in a 1.4M CU transaction.
 
 ### The attack it stops
 
@@ -196,7 +245,7 @@ the chain (tx aborts) or show the truth (signer catches it).
   in the CPI path of the vote itself. A bug in it can cause false rejections, never a forged
   approval beyond what the signer already signed.
 - The offline device's policy must be: **only sign a transaction it can fully decode as
-  `[compute budget*, verify_buffer_hash?, verify_proposal, proposal_approve]`** with this
+  `[compute budget*, verify_buffer_hash?, (assert_account_hash | assert_program_revision)*, verify_proposal, proposal_approve]`** with this
   program's known program ID, and render the args to the user. Everything else is enforced on-chain.
 - The sysvar only exposes *top-level* instructions, which is why the shape check forbids unknown
   programs outright: a foreign instruction could otherwise CPI into Squads (with the member's
@@ -214,6 +263,8 @@ the chain (tx aborts) or show the truth (signer catches it).
 | ALT addresses resolved via real table accounts | Lookup table liveness (a deactivated table just fails at execution) |
 | Outer tx contains only allowed instructions + the exact vote | Votes on `ConfigTransaction`/`Batch` proposals (see limitations) |
 | Upgrade buffer SHA-256 (when `verify_buffer_hash` is present) | |
+| Raw account data SHA-256 + optional owner (when `assert_account_hash` is present) | |
+| Program → ProgramData link + build SHA-256 (when `assert_program_revision` is present) | |
 
 ## Status & limitations
 
@@ -271,8 +322,18 @@ funds vault 0, creates a vault transaction (0.001 SOL transfer vault → wallet)
 submits a **tampered** approval (must fail on-chain with `DataMismatch`, no vote recorded), then
 creates a decoy proposal #2 that drains the vault and tries two **substitution** attacks — honest #1
 shown but the vote cast on #2 (`VoteProposalMismatch`), and #2's proposal paired with #1's
-transaction (`TransactionIndexMismatch`) — and finally submits the **honest** approval (must pass)
-and executes the vault transaction.
+transaction (`TransactionIndexMismatch`) — and finally submits the **honest** approval (must pass,
+bundled with `assert_account_hash` on the multisig account and `assert_program_revision` on this
+program) and executes the vault transaction.
+
+`run-e2e.sh` then runs `scripts/e2e-assert.cjs`: one-instruction cases for `assert_account_hash` /
+`assert_program_revision`, each checked on-chain. They cover the honest paths, including Squads v4
+(a large, zero-padded ProgramData), and every failure code except `NotAProgramData` (6046). That
+one is defence in depth: across transactions, a loader-owned account at a Program's stored address
+is always its ProgramData; it could only differ within a transaction that also closes the program. The failure cases are wrong owner, wrong or malformed hash, args/account mismatch,
+ProgramData passed as the program, a non-loader account, another program's ProgramData, and a
+closed program (a throwaway deploy, so the wallet needs about 3 SOL, refunded on close). The two
+Squads cases run only where Squads v4 exists (surfpool, devnet, mainnet).
 
 ```bash
 surfpool start                      # terminal 1: local mainnet fork (real Squads program)
@@ -437,14 +498,30 @@ For upgrade proposals, prepend `verify_buffer_hash({ buffer, expectedHash })` wh
 `expectedHash` is the 64-char lowercase hex from `solana-verify get-buffer-hash` (or
 `scripts/program-hash.cjs`).
 
+To pin other state, prepend any number of:
+
+```js
+await program.methods
+  .assertAccountHash({ account, owner /* PublicKey | null */, expectedHash: sha256Hex(info.data) })
+  .accounts({ account })
+  .instruction();
+
+// programData = the address stored at bytes 4..36 of the program account
+await program.methods
+  .assertProgramRevision({ program: programId, expectedHash /* solana-verify get-program-hash */ })
+  .accounts({ program: programId, programData })
+  .instruction();
+```
+
 ## Repo layout
 
-- `programs/squads-clear-signing/src/lib.rs` — entrypoint, accounts, IDL-visible arg types (`verify_proposal`, `verify_buffer_hash`)
+- `programs/squads-clear-signing/src/lib.rs` — entrypoint, accounts, IDL-visible arg types (`verify_proposal`, `verify_buffer_hash`, `assert_account_hash`, `assert_program_revision`)
 - `programs/squads-clear-signing/src/squads.rs` — mirrored Squads v4 layouts (VaultTransaction, Proposal header), discriminators
-- `programs/squads-clear-signing/src/validation.rs` — pure validation logic (message diff, ALT resolution, buffer hashing) + unit tests
+- `programs/squads-clear-signing/src/validation.rs` — pure validation logic (message diff, ALT resolution, buffer/program/account hashing) + unit tests
 - `programs/squads-clear-signing/src/errors.rs` — granular failure codes
 - `programs/squads-clear-signing/tests/mainnet_fixture.rs` — decodes a real mainnet VaultTransaction
 - `scripts/e2e.cjs` / `run-e2e.sh` — simple system-transfer proposal, tampered vs honest approval
+- `scripts/e2e-assert.cjs` — on-chain cases for `assert_account_hash` / `assert_program_revision`
 - `scripts/e2e-super.sh` — full super-squads bundle (upgrade + verify + idl) with buffer-hash + v1
 - `scripts/approve-clearsign.cjs` — reusable clear-signed approval builder, legacy tx (+ tamper modes)
 - `scripts/approve-clearsign-v1.cjs` — kit-based clear-signed approval as a v1 (4 KB) transaction
