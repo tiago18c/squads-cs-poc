@@ -121,10 +121,10 @@ pub mod squads_clear_signing {
     /// - the **ed25519 programmatic signer**: the top-level instruction is its
     ///   `Submit`, and the list is the execution message handed to the
     ///   message executor;
-    /// - **Vector**: the top-level instruction is a `Passthrough` of a known
-    ///   Vector program that owns the member account, with the member as its
-    ///   vector account. No other instruction of that program may appear in
-    ///   the transaction except `Advance`.
+    /// - **Vector**: the top-level instruction is a `Passthrough` of the
+    ///   Vector program, signing as the member (a vector account or its
+    ///   system PDA). No other instruction of that program may appear in the
+    ///   transaction except `Advance`.
     ///
     /// In both, the member must not be a transaction signer, and this
     /// instruction must be one the driver invokes directly.
@@ -190,11 +190,10 @@ pub mod squads_clear_signing {
             let message = validation::eps_execution_message(&driver.data)?;
             validation::validate_embedded_v1_message(message, &own_data, &expectation)?;
             TRANSACTION_LEVEL_STACK_HEIGHT + 2
-        } else if validation::VECTOR_PROGRAM_IDS.contains(&driver.program_id)
-            && driver.program_id == *ctx.accounts.member.owner
-        {
-            // Passthrough -> listed instruction. The member is a vector
-            // account of this very Vector program.
+        } else if driver.program_id == validation::VECTOR_PROGRAM_ID {
+            // Passthrough -> listed instruction. The member signs this CPI
+            // without signing the transaction, so it is one of the addresses
+            // this Passthrough signs as: a vector account or its system PDA.
             validation::validate_vector_passthrough(
                 &driver.data,
                 &driver.accounts,
@@ -498,8 +497,8 @@ pub struct VerifyProposalCpi<'info> {
     pub instructions_sysvar: UncheckedAccount<'info>,
 
     /// The multisig member casting the vote: the programmatic signer, which
-    /// must sign this CPI (and equal `args.member`). For Vector, this is the
-    /// vector account, owned by its Vector program.
+    /// must sign this CPI (and equal `args.member`). For Vector, this is a
+    /// vector account or its system PDA.
     pub member: Signer<'info>,
     //
     // remaining_accounts: address lookup tables, as in `verify_proposal`.

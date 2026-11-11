@@ -498,27 +498,15 @@ pub const ED25519_SIGNER_PROGRAM_ID: Pubkey =
 pub const MESSAGE_EXECUTOR_PROGRAM_ID: Pubkey =
     pubkey!("ExecxgyHYsAXB4c5dZodV1zJZ9hqfsDCYkRDRATrpkFR");
 
-/// The Vector programs, one per signature scheme (ed25519, secp256k1,
-/// EIP-191, Falcon-512, ML-DSA-44, Winternitz, XMSS). They share one wire
-/// layout.
-pub const VECTOR_PROGRAM_IDS: [Pubkey; 7] = [
-    pubkey!("vectorcLBXJ2TuoKuUygkEi6FWqvBnbHDEDWoYamfjV"),
-    pubkey!("9NCknbW4LpePSZzbZGFk2HHsSH4y4pkmRjEguJo7qqjd"),
-    pubkey!("G6okL1MvXx7k5eytY7wRXNupXyYG1QVZW37ygAjMiTTu"),
-    pubkey!("HdkE3dPYgCRZJgLv64mbFmojyCprUim8VRXzK2wR6Qgm"),
-    pubkey!("5qR1iCC5hinGAR9iE8dp5xJyh3Wq1Cwsxa4BuBuJieMr"),
-    pubkey!("GvCGfvMTr8YZJZkV9KxaGF1Y2EzxUksur8iDwjVwJwGf"),
-    pubkey!("7qCyy3NJQDMctSDiM4DxNjNR6TyasouyyRTBREhcXdsE"),
-];
+/// The Vector program: one program for every signature scheme.
+pub const VECTOR_PROGRAM_ID: Pubkey = pubkey!("74mXFW7BSAAwc6zQC2uYKuDcWnz17HHXMWqLnEeg9BJv");
 
 /// ed25519 signer `Submit` / message executor `Execute` discriminators.
 const SUBMIT_DISCRIMINATOR: u8 = 0;
 const EXECUTE_DISCRIMINATOR: u8 = 0;
 /// Vector `Advance` / `Passthrough` discriminators.
-const VECTOR_ADVANCE_DISCRIMINATOR: u8 = 1;
-const VECTOR_PASSTHROUGH_DISCRIMINATOR: u8 = 4;
-/// Vector `Passthrough` accounts: `[vector PDA, instructions sysvar, payload...]`.
-const VECTOR_FIRST_PAYLOAD_ACCOUNT: usize = 2;
+const VECTOR_ADVANCE_DISCRIMINATOR: u8 = 0;
+const VECTOR_PASSTHROUGH_DISCRIMINATOR: u8 = 1;
 
 /// Version prefix byte of a serialized Solana v1 message (SIMD-0385).
 const V1_MESSAGE_PREFIX: u8 = 0x81;
@@ -710,17 +698,20 @@ pub fn validate_embedded_v1_message(
 /// given that top-level instruction's data and accounts:
 ///
 /// ```text
-/// data:     0x04 | count u8 | count * { num_accounts u8, data_len u16, data }
-/// accounts: vector PDA, instructions sysvar,
+/// data:     0x01 | num_signers u8 | num_signers * (0 = vector account | 1 = its system PDA)
+///           | count u8 | count * { num_accounts u8, data_len u16, data }
+/// accounts: instructions sysvar, num_signers vector accounts,
 ///           then per sub-instruction: program account, its num_accounts accounts
 /// ```
 ///
-/// The vector PDA (account 0) must be the expected member. Data and accounts
-/// must be consumed exactly, as Vector itself requires.
+/// Data and accounts must be consumed exactly, as Vector itself requires.
 ///
-/// The top-level signer flags describe the transaction, not the CPI: Vector
-/// promotes its PDA to a signer in every sub-instruction that lists it, so
-/// the member counts as a signer of the embedded vote.
+/// Vector invokes each sub-instruction with every signer's address (the
+/// vector account or its system PDA) promoted to a signer wherever it
+/// appears. The top-level signer flags describe the transaction, not the
+/// CPI, so the expected member counts as a signer of the embedded vote: the
+/// caller has established that it is one of this `Passthrough`'s signers (it
+/// signs this very invocation without signing the transaction).
 pub fn validate_vector_passthrough(
     data: &[u8],
     accounts: &[anchor_lang::solana_program::instruction::AccountMeta],
@@ -728,13 +719,24 @@ pub fn validate_vector_passthrough(
     expectation: &VoteExpectation,
 ) -> Result<()> {
     require!(
-        data.first() == Some(&VECTOR_PASSTHROUGH_DISCRIMINATOR)
-            && accounts.first().map(|m| m.pubkey) == Some(expectation.member),
+        data.first() == Some(&VECTOR_PASSTHROUGH_DISCRIMINATOR),
         ClearSigningError::MalformedDriverInstruction
     );
-    let count = usize::from(*data.get(1).ok_or_else(malformed)?);
-    let mut cursor = 2;
-    let mut account_cursor = VECTOR_FIRST_PAYLOAD_ACCOUNT;
+    let num_signers = usize::from(*data.get(1).ok_or_else(bad_driver)?);
+    let signs = data.get(2..2 + num_signers).ok_or_else(bad_driver)?;
+    require!(
+        num_signers >= 1 && signs.iter().all(|&s| s <= 1),
+        ClearSigningError::MalformedDriverInstruction
+    );
+    let mut cursor = 2 + num_signers;
+    // Accounts: the instructions sysvar, the signers, then the payload.
+    let mut account_cursor = 1 + num_signers;
+    require!(
+        accounts.len() >= account_cursor,
+        ClearSigningError::MalformedDriverInstruction
+    );
+    let count = usize::from(*data.get(cursor).ok_or_else(malformed)?);
+    cursor += 1;
 
     let mut votes = 0;
     let mut found_self = false;
@@ -774,10 +776,11 @@ pub fn validate_vector_passthrough(
     finish_embedded(votes, found_self)
 }
 
-/// One Vector `Advance` authorizes every later `Passthrough` of the same
-/// transaction, so the transaction's other instructions of the Vector
-/// program must all be `Advance`s: a second `Passthrough` would use the
-/// member's signature outside the list checked above.
+/// A Vector `Advance` authorizes every later `Passthrough` of the same
+/// transaction that names its accounts, so the transaction's other
+/// instructions of the Vector program must all be `Advance`s: a second
+/// `Passthrough` could use the member's signature outside the list checked
+/// above.
 pub fn check_vector_sibling(program_id: &Pubkey, data: &[u8], vector_program: &Pubkey) -> Result<()> {
     if program_id == vector_program && data.first() != Some(&VECTOR_ADVANCE_DISCRIMINATOR) {
         return err!(ClearSigningError::ForbiddenDriverInstruction);
@@ -1552,14 +1555,15 @@ mod tests {
         assert_eq!(check(&not_execute), bad);
     }
 
-    /// Vector `Passthrough`: data `[4, count, entries...]`, accounts
-    /// `[vector pda, sysvar, (program, accounts...)*]`.
-    fn passthrough(ixs: &[TestIx]) -> (Vec<u8>, Vec<AccountMeta>) {
-        let mut data = vec![4u8, ixs.len() as u8];
-        let mut metas = vec![
-            AccountMeta::new(pk(103), false),
-            AccountMeta::new_readonly(pk(9), false),
-        ];
+    /// Vector `Passthrough` with the given signers (address, signs-as byte):
+    /// data `[1, n, signs.., count, entries...]`, accounts
+    /// `[sysvar, signers.., (program, accounts...)*]`.
+    fn passthrough_with(signers: &[(Pubkey, u8)], ixs: &[TestIx]) -> (Vec<u8>, Vec<AccountMeta>) {
+        let mut data = vec![1u8, signers.len() as u8];
+        data.extend(signers.iter().map(|s| s.1));
+        data.push(ixs.len() as u8);
+        let mut metas = vec![AccountMeta::new_readonly(pk(9), false)];
+        metas.extend(signers.iter().map(|s| AccountMeta::new(s.0, false)));
         for (program, accounts, ix_data) in ixs {
             data.push(accounts.len() as u8);
             data.extend_from_slice(&(ix_data.len() as u16).to_le_bytes());
@@ -1571,6 +1575,11 @@ mod tests {
         (data, metas)
     }
 
+    /// One signer, the member's vector account signing as itself.
+    fn passthrough(ixs: &[TestIx]) -> (Vec<u8>, Vec<AccountMeta>) {
+        passthrough_with(&[(pk(103), 0)], ixs)
+    }
+
     fn pt(ixs: &[TestIx]) -> Result<()> {
         let (data, metas) = passthrough(ixs);
         validate_vector_passthrough(&data, &metas, OWN, &expectation())
@@ -1579,6 +1588,13 @@ mod tests {
     #[test]
     fn passthrough_accepts_verify_plus_vote() {
         pt(&[embedded_self(), embedded_vote(pk(102))]).unwrap();
+        // The member may be a vector account's system PDA (signs-as 1), so it
+        // is not itself in the signer list; and there may be several signers.
+        let ixs = [embedded_self(), embedded_vote(pk(102))];
+        for signers in [&[(pk(70), 1)][..], &[(pk(71), 0), (pk(70), 1), (pk(103), 0)]] {
+            let (data, metas) = passthrough_with(signers, &ixs);
+            validate_vector_passthrough(&data, &metas, OWN, &expectation()).unwrap();
+        }
     }
 
     #[test]
@@ -1616,13 +1632,18 @@ mod tests {
         let bad_driver = err_code(ClearSigningError::MalformedDriverInstruction);
         let malformed = err_code(ClearSigningError::MalformedEmbeddedInstructions);
         let trailing = err_code(ClearSigningError::EmbeddedTrailingBytes);
-        // Not a Passthrough; a Passthrough of a different vector PDA.
+        // Not a Passthrough (0 is Advance).
         let mut advance = data.clone();
-        advance[0] = 1;
+        advance[0] = 0;
         assert_eq!(check(&advance, &metas), bad_driver);
-        let mut other_pda = metas.clone();
-        other_pda[0].pubkey = pk(66);
-        assert_eq!(check(&data, &other_pda), bad_driver);
+        // No signers, an invalid signs-as byte, fewer accounts than signers.
+        let (none, none_metas) = passthrough_with(&[], &[embedded_self(), embedded_vote(pk(102))]);
+        assert_eq!(check(&none, &none_metas), bad_driver);
+        let mut bad_signs = data.clone();
+        bad_signs[2] = 2;
+        assert_eq!(check(&bad_signs, &metas), bad_driver);
+        assert_eq!(check(&data, &metas[..1]), bad_driver);
+        assert_eq!(check(&data[..2], &metas), bad_driver);
         // Truncated data, missing accounts.
         assert_eq!(check(&data[..data.len() - 1], &metas), malformed);
         assert_eq!(check(&data, &metas[..metas.len() - 1]), malformed);
@@ -1708,10 +1729,11 @@ mod tests {
     #[test]
     fn vector_siblings_must_be_advances() {
         let vector = pk(150);
-        check_vector_sibling(&vector, &[1, 0xAA], &vector).unwrap();
+        check_vector_sibling(&vector, &[0, 0xAA], &vector).unwrap();
         // Other programs are not the member's signer: unrestricted.
-        check_vector_sibling(&pk(200), &[4], &vector).unwrap();
-        for data in [&[4u8, 1][..], &[0], &[]] {
+        check_vector_sibling(&pk(200), &[1], &vector).unwrap();
+        // Passthrough, Initialize, Withdraw, Close, empty.
+        for data in [&[1u8, 1][..], &[2], &[3], &[4], &[]] {
             assert_eq!(
                 code(check_vector_sibling(&vector, data, &vector)),
                 err_code(ClearSigningError::ForbiddenDriverInstruction)
