@@ -565,11 +565,13 @@ impl<'a> V1Prelude<'a> {
     }
 }
 
-/// The member of a `verify_proposal_cpi` must be a programmatic signer: the
-/// driver's top-level instruction lists it (both drivers pass every account
-/// they forward), and it does not sign the transaction. An ordinary keypair
-/// that signs the transaction would pass the driver's signer forwarding, yet
-/// could also vote from any other top-level instruction.
+/// The member of a `verify_proposal_cpi` must be a programmatic signer, not a
+/// key that signs the transaction. Signer flags in the instructions sysvar
+/// are transaction-wide, so a clear flag on the member in the driver's
+/// account list means the key does not sign the transaction at all; its
+/// signature on this CPI can then only come from the driver. A key that does
+/// sign the transaction would be forwarded by both drivers, yet could also
+/// vote from any other top-level instruction.
 pub fn require_programmatic_member(
     driver_accounts: &[anchor_lang::solana_program::instruction::AccountMeta],
     member: &Pubkey,
@@ -1722,6 +1724,7 @@ mod tests {
         assert_eq!(err_code(ClearSigningError::ProgramHashMismatch), 6047);
         assert_eq!(err_code(ClearSigningError::NotInvokedViaCpi), 6048);
         assert_eq!(err_code(ClearSigningError::ForbiddenDriverInstruction), 6055);
+        assert_eq!(err_code(ClearSigningError::MemberIsTransactionSigner), 6056);
         assert_eq!(err_code(ClearSigningError::UnexpectedStackHeight), 6057);
     }
 }

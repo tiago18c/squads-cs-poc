@@ -32,6 +32,14 @@
 //! Any mismatch aborts the transaction, so the vote never lands. If the
 //! transaction succeeds, the only thing that happened is the vote the signer
 //! actually saw.
+//!
+//! ## Programmatic signers
+//!
+//! When the member is a PDA of a signer program and only signs inside a CPI,
+//! the vote is an inner instruction and step 3 cannot see it.
+//! `verify_proposal_cpi` replaces step 3: it parses the signer program's
+//! top-level instruction down to the list of instructions it executes, and
+//! applies the same rule to that list.
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::instruction::{get_stack_height, TRANSACTION_LEVEL_STACK_HEIGHT};
@@ -168,9 +176,9 @@ pub mod squads_clear_signing {
             member: args.member,
             action: args.action,
         };
-        // The member must be a programmatic signer: listed by the driver
-        // instruction but not signing the transaction. A key that signs the
-        // transaction could also vote from any other top-level instruction.
+        // The member must be a programmatic signer, not a transaction signer:
+        // a key that signs the transaction could also vote from any other
+        // top-level instruction.
         validation::require_programmatic_member(&driver.accounts, &args.member)?;
 
         // Each driver invokes its listed instructions directly, at a fixed
