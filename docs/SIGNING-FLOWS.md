@@ -71,6 +71,7 @@ The coordinator **prepends** instructions from the companion program to the same
 
 ```
 tx = [ verify_buffer_hash(buffer, sha256-hex)     ← only for program upgrades
+       assert_account_hash / assert_program_revision ← optional: pin other state
        verify_proposal(expected instructions)     ← full inner content, IDL-decodable
        proposal_approve(#42) ]                    ← the vote
 ```
@@ -108,6 +109,7 @@ flowchart LR
 ```
 
 - **Buffer hash** (upgrade proposals): the device displays a SHA-256 digest that is byte-identical to `solana-verify get-buffer-hash`, so the signer can compare the build being deployed against a reviewed or reproducible build.
+- **State pins** (optional): `assert_account_hash` pins any account's raw data (and optionally its owner); `assert_program_revision` pins a deployed program's build, following the program account to its ProgramData and matching `solana-verify get-program-hash`.
 - **The companion program can only abort.** It holds no authority and isn't in the CPI path of the vote. The worst a bug can do is reject a valid vote. It can't forge one.
 
 ---

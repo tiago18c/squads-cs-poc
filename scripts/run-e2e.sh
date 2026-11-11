@@ -35,3 +35,4 @@ else
 fi
 
 RPC_URL="$URL" node scripts/e2e.cjs
+RPC_URL="$URL" node scripts/e2e-assert.cjs

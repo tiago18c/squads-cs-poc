@@ -33,6 +33,22 @@ pub const BUFFER_METADATA_SIZE: usize = 37;
 /// `UpgradeableLoaderState` bincode enum tag for the `Buffer` variant.
 const BUFFER_STATE_TAG: u32 = 1;
 
+/// `UpgradeableLoaderState` bincode enum tag for the `Program` variant.
+const PROGRAM_STATE_TAG: u32 = 2;
+
+/// `UpgradeableLoaderState` bincode enum tag for the `ProgramData` variant.
+const PROGRAMDATA_STATE_TAG: u32 = 3;
+
+/// Serialized size of `UpgradeableLoaderState::Program`: 4-byte enum tag +
+/// 32-byte `programdata_address`.
+pub const PROGRAM_ACCOUNT_SIZE: usize = 36;
+
+/// Serialized size of `UpgradeableLoaderState::ProgramData` metadata: 4-byte
+/// enum tag + 8-byte slot + `Option<Pubkey>` upgrade authority (1 + 32, always
+/// reserved). Program bytes start here. Mirrors
+/// `UpgradeableLoaderState::size_of_programdata_metadata()`.
+pub const PROGRAMDATA_METADATA_SIZE: usize = 45;
+
 /// Size of the serialized lookup-table meta (4-byte enum tag included);
 /// addresses start at this offset. Mirrors
 /// `solana_address_lookup_table_program::state::LOOKUP_TABLE_META_SIZE`.
@@ -253,24 +269,84 @@ pub fn compute_program_hash(program_bytes: &[u8]) -> [u8; 32] {
 }
 
 /// Decode one lowercase-hex nibble.
-fn hex_nibble(c: u8) -> Result<u8> {
+fn hex_nibble(c: u8) -> Option<u8> {
     match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        _ => err!(ClearSigningError::BufferHashMismatch),
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
     }
 }
 
 /// Parse a 64-char lowercase-hex string into a 32-byte SHA-256 digest.
-/// Rejects wrong lengths and non-hex/uppercase characters.
-pub fn hex_to_hash(s: &str) -> Result<[u8; 32]> {
+/// Returns `None` on wrong lengths and non-hex/uppercase characters.
+pub fn parse_hex_hash(s: &str) -> Option<[u8; 32]> {
     let b = s.as_bytes();
-    require!(b.len() == 64, ClearSigningError::BufferHashMismatch);
+    if b.len() != 64 {
+        return None;
+    }
     let mut out = [0u8; 32];
     for i in 0..32 {
         out[i] = (hex_nibble(b[2 * i])? << 4) | hex_nibble(b[2 * i + 1])?;
     }
-    Ok(out)
+    Some(out)
+}
+
+/// `parse_hex_hash` for `verify_buffer_hash`, which has always reported a
+/// malformed digest as `BufferHashMismatch` (kept for error-code stability).
+pub fn hex_to_hash(s: &str) -> Result<[u8; 32]> {
+    parse_hex_hash(s).ok_or(error!(ClearSigningError::BufferHashMismatch))
+}
+
+/// Compare a computed digest against the signer-displayed hex digest. A
+/// malformed `expected_hex` fails with `InvalidHashFormat`, a well-formed but
+/// different one with `mismatch`. Logs both digests on mismatch.
+pub fn check_hash(
+    label: &str,
+    computed: &[u8; 32],
+    expected_hex: &str,
+    mismatch: ClearSigningError,
+) -> Result<()> {
+    let expected =
+        parse_hex_hash(expected_hex).ok_or(error!(ClearSigningError::InvalidHashFormat))?;
+    if *computed != expected {
+        msg!("{} hash mismatch", label);
+        msg!("  computed: {}", hash_to_hex(computed));
+        msg!("  expected: {}", expected_hex);
+        return Err(mismatch.into());
+    }
+    Ok(())
+}
+
+/// SHA-256 (native `sol_sha256` syscall) of an account's **raw, untrimmed**
+/// data — the generic commitment checked by `assert_account_hash`. Off-chain
+/// equivalent: `sha256(account.data)`. Unlike program hashes, no trailing-zero
+/// trimming is applied: for arbitrary account state, trailing zeros are
+/// meaningful (e.g. a zero balance field at the end of a struct).
+pub fn compute_account_hash(data: &[u8]) -> [u8; 32] {
+    solana_sha256_hasher::hash(data).to_bytes()
+}
+
+/// Parse a loader-v3 `Program` account, returning its `programdata_address`.
+pub fn parse_program_account(data: &[u8]) -> Result<Pubkey> {
+    require!(
+        data.len() >= PROGRAM_ACCOUNT_SIZE,
+        ClearSigningError::NotAProgram
+    );
+    let tag = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    require!(tag == PROGRAM_STATE_TAG, ClearSigningError::NotAProgram);
+    Ok(Pubkey::new_from_array(data[4..36].try_into().unwrap()))
+}
+
+/// Extract the program (ELF) bytes from a loader-v3 `ProgramData` account's
+/// data, validating the state tag.
+pub fn extract_programdata_program_bytes(data: &[u8]) -> Result<&[u8]> {
+    require!(
+        data.len() >= PROGRAMDATA_METADATA_SIZE,
+        ClearSigningError::NotAProgramData
+    );
+    let tag = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    require!(tag == PROGRAMDATA_STATE_TAG, ClearSigningError::NotAProgramData);
+    Ok(&data[PROGRAMDATA_METADATA_SIZE..])
 }
 
 /// Encode a 32-byte digest as a lowercase-hex string (for log/error output).
@@ -646,6 +722,100 @@ mod tests {
             code(extract_buffer_program_bytes(&[1, 0, 0]).map(|_| ())),
             err_code(ClearSigningError::NotABuffer)
         );
+    }
+
+    // --- account hash / program revision tests ---
+
+    #[test]
+    fn account_hash_is_untrimmed_sha256() {
+        use sha2::{Digest, Sha256};
+        for input in [&b""[..], b"abc", b"abc\x00\x00", &[0u8; 300]] {
+            let expected: [u8; 32] = Sha256::digest(input).into();
+            assert_eq!(compute_account_hash(input), expected);
+        }
+        // Trailing zeros are significant for raw account state.
+        assert_ne!(compute_account_hash(b"abc\x00"), compute_account_hash(b"abc"));
+    }
+
+    #[test]
+    fn check_hash_distinguishes_format_and_mismatch() {
+        let h = compute_account_hash(b"state");
+        let hex = hash_to_hex(&h);
+        check_hash("t", &h, &hex, ClearSigningError::AccountHashMismatch).unwrap();
+
+        let other = hash_to_hex(&compute_account_hash(b"other"));
+        assert_eq!(
+            code(check_hash("t", &h, &other, ClearSigningError::AccountHashMismatch)),
+            err_code(ClearSigningError::AccountHashMismatch)
+        );
+        assert_eq!(
+            code(check_hash("t", &h, &other, ClearSigningError::ProgramHashMismatch)),
+            err_code(ClearSigningError::ProgramHashMismatch)
+        );
+        for bad in [&hex[..63], &hex.to_uppercase(), ""] {
+            assert_eq!(
+                code(check_hash("t", &h, bad, ClearSigningError::AccountHashMismatch)),
+                err_code(ClearSigningError::InvalidHashFormat)
+            );
+        }
+    }
+
+    #[test]
+    fn parses_program_account() {
+        let mut data = vec![2u8, 0, 0, 0];
+        data.extend_from_slice(pk(77).as_ref());
+        assert_eq!(parse_program_account(&data).unwrap(), pk(77));
+
+        // Buffer / ProgramData / Uninitialized tags are rejected.
+        for tag in [0u8, 1, 3] {
+            let mut bad = data.clone();
+            bad[0] = tag;
+            assert_eq!(
+                code(parse_program_account(&bad).map(|_| ())),
+                err_code(ClearSigningError::NotAProgram)
+            );
+        }
+        assert_eq!(
+            code(parse_program_account(&data[..35]).map(|_| ())),
+            err_code(ClearSigningError::NotAProgram)
+        );
+    }
+
+    #[test]
+    fn extracts_programdata_bytes() {
+        // 4-byte tag (3 = ProgramData) + 8-byte slot + 33-byte authority option.
+        let mut data = vec![0u8; PROGRAMDATA_METADATA_SIZE];
+        data[0] = 3;
+        data[4] = 42; // slot
+        data[12] = 1; // Some(authority)
+        data[13..45].copy_from_slice(pk(5).as_ref());
+        data.extend_from_slice(b"elf-bytes\x00\x00");
+        assert_eq!(extract_programdata_program_bytes(&data).unwrap(), b"elf-bytes\x00\x00");
+        // Program hash uses the solana-verify trimming convention.
+        assert_eq!(
+            compute_program_hash(extract_programdata_program_bytes(&data).unwrap()),
+            compute_program_hash(b"elf-bytes")
+        );
+
+        // A Buffer is not a ProgramData.
+        let mut bad = data.clone();
+        bad[0] = 1;
+        assert_eq!(
+            code(extract_programdata_program_bytes(&bad).map(|_| ())),
+            err_code(ClearSigningError::NotAProgramData)
+        );
+        assert_eq!(
+            code(extract_programdata_program_bytes(&data[..44]).map(|_| ())),
+            err_code(ClearSigningError::NotAProgramData)
+        );
+    }
+
+    #[test]
+    fn new_error_codes_are_appended() {
+        // Existing codes must not move when variants are added.
+        assert_eq!(err_code(ClearSigningError::ProposalIndexMismatch), 6036);
+        assert_eq!(err_code(ClearSigningError::InvalidHashFormat), 6037);
+        assert_eq!(err_code(ClearSigningError::ProgramHashMismatch), 6047);
     }
 
     // --- transaction shape tests ---

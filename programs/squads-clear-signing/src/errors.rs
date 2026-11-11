@@ -78,4 +78,27 @@ pub enum ClearSigningError {
     ProposalMultisigMismatch,
     #[msg("Proposal.transaction_index does not match the expected transaction_index")]
     ProposalIndexMismatch,
+    // --- assert_account_hash / assert_program_revision (6037+) ---
+    #[msg("Expected hash is not a 64-char lowercase hex string")]
+    InvalidHashFormat,
+    #[msg("Account does not match the address in the args")]
+    AssertedAccountMismatch,
+    #[msg("Account owner does not match the expected owner")]
+    AccountOwnerMismatch,
+    #[msg("Account data does not hash to the expected value")]
+    AccountHashMismatch,
+    #[msg("Program account does not match the address in the args")]
+    ProgramKeyMismatch,
+    #[msg("Program account is not owned by the BPF upgradeable loader")]
+    InvalidProgramOwner,
+    #[msg("Account is not a BPF upgradeable loader Program")]
+    NotAProgram,
+    #[msg("ProgramData account does not match the address stored in the Program account")]
+    ProgramDataAddressMismatch,
+    #[msg("ProgramData account is not owned by the BPF upgradeable loader")]
+    InvalidProgramDataOwner,
+    #[msg("Account is not a BPF upgradeable loader ProgramData")]
+    NotAProgramData,
+    #[msg("Program bytes do not hash to the expected value")]
+    ProgramHashMismatch,
 }

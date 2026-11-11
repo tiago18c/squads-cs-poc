@@ -8,7 +8,8 @@
  *   3. create + activate the proposal
  *   4. TAMPERED approval:  [verify_proposal(wrong lamports), proposal_approve] -> must FAIL on-chain
  *  4b. SUBSTITUTION:       honest #N shown, vote cast on a decoy #N+1 (two variants) -> must FAIL
- *   5. HONEST approval:    [verify_proposal(chain truth),   proposal_approve] -> must succeed
+ *   5. HONEST approval:    [assert_program_revision, assert_account_hash(vault tx),
+ *                           verify_proposal(chain truth), proposal_approve] -> must succeed
  *   6. execute the vault transaction and confirm the transfer landed
  *
  * Env:
@@ -325,8 +326,26 @@ async function main() {
 
   // --- 5. HONEST approval must succeed --------------------------------------
   if (proposal.approved.length === 0) {
-    step("attempt 2: HONEST expected data (matches chain) — must succeed");
-    const good = await sendTx(connection, [await makeVerifyIx(expected), approveIx], [wallet]);
+    step("attempt 2: HONEST expected data (matches chain) + account/program assertions — must succeed");
+    // Also pin the raw VaultTransaction account (owned by Squads) and this
+    // program's own revision: the shape check must tolerate both alongside the vote.
+    const sha256 = (b) => require("crypto").createHash("sha256").update(b).digest("hex");
+    const trimZeros = (b) => { let e = b.length; while (e > 0 && b[e - 1] === 0) e--; return b.subarray(0, e); };
+    const txInfo = await withRetry(() => connection.getAccountInfo(transactionPda), "getAccountInfo");
+    const progInfo = await withRetry(() => connection.getAccountInfo(programId), "getAccountInfo");
+    const programDataPda = new PublicKey(progInfo.data.subarray(4, 36));
+    const pdInfo = await withRetry(() => connection.getAccountInfo(programDataPda), "getAccountInfo");
+    const assertTxIx = await program.methods
+      .assertAccountHash({ account: transactionPda, owner: multisig.PROGRAM_ID, expectedHash: sha256(txInfo.data) })
+      .accounts({ account: transactionPda })
+      .instruction();
+    const assertRevisionIx = await program.methods
+      .assertProgramRevision({ program: programId, expectedHash: sha256(trimZeros(pdInfo.data.subarray(45))) })
+      .accounts({ program: programId, programData: programDataPda })
+      .instruction();
+    const good = await sendTx(
+      connection, [assertRevisionIx, assertTxIx, await makeVerifyIx(expected), approveIx], [wallet],
+    );
     if (good.err) throw new Error(`honest approval failed: ${JSON.stringify(good.err)}`);
     proposal = await fetchProposal();
     if (proposal.approved.length !== 1) throw new Error("expected exactly 1 approval");

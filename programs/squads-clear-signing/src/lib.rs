@@ -218,6 +218,108 @@ pub mod squads_clear_signing {
         );
         Ok(())
     }
+
+    /// Assert that an arbitrary account's raw data hashes to
+    /// `args.expected_hash` (SHA-256 over the **untrimmed** account data, as
+    /// lowercase hex), and — when `args.owner` is `Some` — that the account is
+    /// owned by that program. Lets an offline signer pin the exact state of
+    /// any account a proposal depends on (a config, a mint, an oracle, ...).
+    /// Aborts the transaction on any mismatch.
+    pub fn assert_account_hash(
+        ctx: Context<AssertAccountHash>,
+        args: AssertAccountHashArgs,
+    ) -> Result<()> {
+        let account = &ctx.accounts.account;
+        require_keys_eq!(
+            account.key(),
+            args.account,
+            ClearSigningError::AssertedAccountMismatch
+        );
+        if let Some(owner) = args.owner {
+            require_keys_eq!(*account.owner, owner, ClearSigningError::AccountOwnerMismatch);
+        }
+        let data = account.try_borrow_data()?;
+        let hash = validation::compute_account_hash(&data);
+        validation::check_hash(
+            "account",
+            &hash,
+            &args.expected_hash,
+            ClearSigningError::AccountHashMismatch,
+        )?;
+        msg!(
+            "account hash OK: {} (owner {}, {} bytes)",
+            account.key(),
+            account.owner,
+            data.len(),
+        );
+        Ok(())
+    }
+
+    /// Assert that a deployed loader-v3 program runs exactly the build hashing
+    /// to `args.expected_hash`. A specialization of `assert_account_hash` for
+    /// upgradeable programs, which keep their code in a separate ProgramData
+    /// account:
+    ///
+    /// 1. the `program` account equals `args.program`, is owned by the BPF
+    ///    upgradeable loader, and is in the `Program` state;
+    /// 2. the `programdata_address` stored in it equals the passed
+    ///    `program_data` account, which is also loader-owned and in the
+    ///    `ProgramData` state;
+    /// 3. the ProgramData's program bytes (trailing zeros trimmed) SHA-256 to
+    ///    `args.expected_hash` — byte-identical to
+    ///    `solana-verify get-program-hash <program>`.
+    ///
+    /// The ProgramData metadata (deploy slot, upgrade authority) is not part
+    /// of the hash, so the digest identifies the build, not the deployment.
+    pub fn assert_program_revision(
+        ctx: Context<AssertProgramRevision>,
+        args: AssertProgramRevisionArgs,
+    ) -> Result<()> {
+        let program = &ctx.accounts.program;
+        let program_data = &ctx.accounts.program_data;
+
+        // 1. The program account itself.
+        require_keys_eq!(program.key(), args.program, ClearSigningError::ProgramKeyMismatch);
+        require_keys_eq!(
+            *program.owner,
+            validation::BPF_LOADER_UPGRADEABLE_ID,
+            ClearSigningError::InvalidProgramOwner
+        );
+        let programdata_address = {
+            let data = program.try_borrow_data()?;
+            validation::parse_program_account(&data)?
+        };
+
+        // 2. Its contents must point at the passed ProgramData account.
+        require_keys_eq!(
+            program_data.key(),
+            programdata_address,
+            ClearSigningError::ProgramDataAddressMismatch
+        );
+        require_keys_eq!(
+            *program_data.owner,
+            validation::BPF_LOADER_UPGRADEABLE_ID,
+            ClearSigningError::InvalidProgramDataOwner
+        );
+
+        // 3. The ProgramData's program bytes hash.
+        let data = program_data.try_borrow_data()?;
+        let program_bytes = validation::extract_programdata_program_bytes(&data)?;
+        let hash = validation::compute_program_hash(program_bytes);
+        validation::check_hash(
+            "program",
+            &hash,
+            &args.expected_hash,
+            ClearSigningError::ProgramHashMismatch,
+        )?;
+        msg!(
+            "program revision OK: {} (programdata {}, {} program bytes, trailing zeros trimmed)",
+            program.key(),
+            program_data.key(),
+            validation::trim_trailing_zeros(program_bytes).len(),
+        );
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -245,6 +347,49 @@ pub struct VerifyBufferHash<'info> {
     /// The BPF upgradeable-loader Buffer account whose contents are checked.
     /// CHECK: owner, state tag, and content hash are validated in the handler.
     pub buffer: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct AssertAccountHash<'info> {
+    /// The account whose data (and optionally owner) is asserted.
+    /// CHECK: key, optional owner, and content hash are validated in the handler.
+    pub account: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct AssertProgramRevision<'info> {
+    /// The loader-v3 Program account (the program id).
+    /// CHECK: key, owner, and `Program` state are validated in the handler.
+    pub program: UncheckedAccount<'info>,
+    /// The ProgramData account the program account points at.
+    /// CHECK: must equal the program's stored `programdata_address`; owner,
+    /// `ProgramData` state, and program-bytes hash are validated in the handler.
+    pub program_data: UncheckedAccount<'info>,
+}
+
+/// Binds an arbitrary account to the exact state the offline signer reviewed.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct AssertAccountHashArgs {
+    /// The account under verification (must equal the passed account —
+    /// duplicated here so the offline device renders it from the args alone).
+    pub account: Pubkey,
+    /// If set, the program that must own the account.
+    pub owner: Option<Pubkey>,
+    /// SHA-256 of the account's raw data (no trimming), as a **lowercase hex
+    /// string** (64 chars).
+    pub expected_hash: String,
+}
+
+/// Binds a deployed upgradeable program to the exact build the offline
+/// signer reviewed.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct AssertProgramRevisionArgs {
+    /// The program id under verification (must equal the passed account).
+    pub program: Pubkey,
+    /// SHA-256 of the ProgramData's program bytes with trailing zeros
+    /// trimmed, as a **lowercase hex string** (64 chars) — byte-identical to
+    /// `solana-verify get-program-hash <program>`.
+    pub expected_hash: String,
 }
 
 /// Binds a buffer account to the exact build the offline signer reviewed.
