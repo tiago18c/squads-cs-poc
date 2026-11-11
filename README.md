@@ -184,7 +184,7 @@ accounts contain* at vote time. Two standalone assertions let the signer pin tha
 take a 64-char lowercase-hex SHA-256 (`InvalidHashFormat`, 6037, otherwise) and abort on mismatch.
 
 **`assert_account_hash({ account, owner: Option<Pubkey>, expected_hash })`** — any account
-(a config, a mint, an oracle, the vault transaction itself):
+(the multisig's own config, a mint, an oracle, a program's config PDA):
 
 1. the passed account equals `args.account` (`AssertedAccountMismatch`, 6038);
 2. if `owner` is `Some`, the account's owner equals it (`AccountOwnerMismatch`, 6039) — pass it
@@ -192,6 +192,10 @@ take a 64-char lowercase-hex SHA-256 (`InvalidHashFormat`, 6037, otherwise) and 
 3. `sha256(account.data)` over the **raw, untrimmed** data equals `expected_hash`
    (`AccountHashMismatch`, 6040). Unlike program hashes, trailing zeros are significant for
    account state, so nothing is trimmed. Off-chain: `sha256(getAccountInfo(account).data)`.
+
+Only data and (optionally) owner are covered — not lamports or the executable flag. A missing
+account has empty data and the system program as owner, so it passes with `sha256("")` unless
+`owner` excludes that.
 
 **`assert_program_revision({ program, expected_hash })`** — the specialization for a deployed
 loader-v3 program, whose code lives in a separate ProgramData account:
@@ -205,12 +209,20 @@ loader-v3 program, whose code lives in a separate ProgramData account:
    (`ProgramHashMismatch`, 6047) — byte-identical to `solana-verify get-program-hash <program>`.
 
 The ProgramData metadata (deploy slot, upgrade authority) is excluded, so the digest identifies
-the build, not the deployment. Typical use: pin the revision of a program a proposal CPIs into, or
-confirm the currently deployed build before approving its upgrade.
+the build, not the deployment. Typical uses: confirm the build a proposal will interact with, or
+the currently deployed build before approving its upgrade.
 
-Both hash with the `sol_sha256` syscall, which costs about **0.5 CU per byte** (≈112k CU for a
-210 KB program). Raise the compute-unit limit for large programs; data beyond ~2.5 MB cannot be
-hashed within a 1.4M CU transaction.
+> **Vote-time only.** Like every check in this program, both assertions hold in the vote
+> transaction, not at `vault_transaction_execute`. An account can change, and a program with a live
+> upgrade authority can be upgraded, between the vote and execution. Pinning is durable only for
+> state that can't change afterwards (e.g. an immutable program, or one whose upgrade authority is
+> this multisig's own vault).
+
+Cost: hashing uses the `sol_sha256` syscall at about **0.5 CU per hashed byte**. For programs that's
+the trimmed ELF size, not the ProgramData allocation: zero padding is skipped in 4 KB `sol_memcmp`
+chunks for a few CU each. Measured: ≈112k CU for this program (210 KB), ≈517k CU for Squads v4
+(980 KB ELF in a 1.47 MB ProgramData). Raise the compute-unit limit accordingly; more than about
+2.5 MB of hashed bytes doesn't fit in a 1.4M CU transaction.
 
 ### The attack it stops
 
@@ -232,7 +244,7 @@ the chain (tx aborts) or show the truth (signer catches it).
   in the CPI path of the vote itself. A bug in it can cause false rejections, never a forged
   approval beyond what the signer already signed.
 - The offline device's policy must be: **only sign a transaction it can fully decode as
-  `[compute budget*, verify_buffer_hash?, assert_account_hash*, assert_program_revision*, verify_proposal, proposal_approve]`** with this
+  `[compute budget*, verify_buffer_hash?, (assert_account_hash | assert_program_revision)*, verify_proposal, proposal_approve]`** with this
   program's known program ID, and render the args to the user. Everything else is enforced on-chain.
 - The sysvar only exposes *top-level* instructions, which is why the shape check forbids unknown
   programs outright: a foreign instruction could otherwise CPI into Squads (with the member's
@@ -310,13 +322,17 @@ submits a **tampered** approval (must fail on-chain with `DataMismatch`, no vote
 creates a decoy proposal #2 that drains the vault and tries two **substitution** attacks — honest #1
 shown but the vote cast on #2 (`VoteProposalMismatch`), and #2's proposal paired with #1's
 transaction (`TransactionIndexMismatch`) — and finally submits the **honest** approval (must pass,
-bundled with `assert_program_revision` on this program and `assert_account_hash` on the vault
-transaction) and executes the vault transaction.
+bundled with `assert_account_hash` on the multisig account and `assert_program_revision` on this
+program) and executes the vault transaction.
 
-`run-e2e.sh` then runs `scripts/e2e-assert.cjs`: 14 one-instruction cases for
-`assert_account_hash` / `assert_program_revision` — the honest paths plus every failure code
-(wrong owner, wrong/malformed hash, args/account mismatch, programdata passed as the program, a
-non-loader account, another program's programdata), each checked on-chain.
+`run-e2e.sh` then runs `scripts/e2e-assert.cjs`: one-instruction cases for `assert_account_hash` /
+`assert_program_revision`, each checked on-chain. They cover the honest paths, including Squads v4
+(a large, zero-padded ProgramData), and every failure code except `NotAProgramData` (6046). That
+one is defence in depth: a loader-owned account at a Program's stored address is always its
+ProgramData. The failure cases are wrong owner, wrong or malformed hash, args/account mismatch,
+ProgramData passed as the program, a non-loader account, another program's ProgramData, and a
+closed program (a throwaway deploy, so the wallet needs about 3 SOL, refunded on close). The two
+Squads cases run only where Squads v4 exists (surfpool, devnet, mainnet).
 
 ```bash
 surfpool start                      # terminal 1: local mainnet fork (real Squads program)

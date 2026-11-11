@@ -18,10 +18,13 @@
  */
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
+const { execFileSync } = require("child_process");
 const bs58 = (() => { const m = require("bs58"); return m.default ?? m; })();
-const { Connection, Keypair, PublicKey, Transaction, LAMPORTS_PER_SOL } = require("@solana/web3.js");
+const {
+  Connection, Keypair, PublicKey, Transaction, ComputeBudgetProgram, LAMPORTS_PER_SOL,
+} = require("@solana/web3.js");
 const anchor = require("@anchor-lang/core");
+const { trim, sha256Hex: sha256, PROGRAMDATA_METADATA_SIZE } = require("./program-hash.cjs");
 
 const ROOT = path.join(__dirname, "..");
 const RPC_URL = process.env.RPC_URL || "http://127.0.0.1:8899";
@@ -34,22 +37,43 @@ const PACE_MS = IS_LOCAL ? 0 : 3000;
 const LOADER_V3 = new PublicKey("BPFLoaderUpgradeab1e11111111111111111111111");
 const SQUADS_V4 = new PublicKey("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf");
 const SYSTEM = new PublicKey("11111111111111111111111111111111");
-const PROGRAMDATA_METADATA_SIZE = 45;
 
 const ok = (m) => console.log(`\x1b[32m✔\x1b[0m ${m}`);
 const step = (m) => console.log(`\n\x1b[36m▶ ${m}\x1b[0m`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const sha256 = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
-function trim(bytes) {
-  let end = bytes.length;
-  while (end > 0 && bytes[end - 1] === 0) end--;
-  return bytes.subarray(0, end);
+
+/** solana-verify get-program-hash, from chain: Program -> ProgramData -> trimmed ELF. */
+async function chainProgramHash(connection, programId) {
+  const info = await connection.getAccountInfo(programId);
+  if (!info) return null;
+  const programData = new PublicKey(info.data.subarray(4, 36));
+  const pd = await connection.getAccountInfo(programData);
+  const elf = pd.data.subarray(PROGRAMDATA_METADATA_SIZE);
+  return { programData, hash: sha256(trim(elf)), elfLen: elf.length, trimmedLen: trim(elf).length };
+}
+
+/** Deploy a throwaway copy of the .so and close it, leaving a Program account
+ *  whose stored programdata address is no longer a loader-owned ProgramData. */
+function deployAndCloseProgram() {
+  if (!fs.existsSync(SO_PATH)) return null;
+  const kpPath = path.join(ROOT, "target", "e2e-closed-program-keypair.json");
+  fs.writeFileSync(kpPath, JSON.stringify(Array.from(Keypair.generate().secretKey)));
+  const cli = (...a) => execFileSync("solana", [...a, "-u", RPC_URL, "-k", WALLET_PATH], { stdio: "pipe" });
+  try {
+    cli("program", "deploy", SO_PATH, "--program-id", kpPath);
+    const id = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(kpPath)))).publicKey;
+    cli("program", "close", id.toBase58(), "--bypass-warning");
+    return id;
+  } finally {
+    fs.rmSync(kpPath, { force: true });
+  }
 }
 
 async function sendTx(connection, instructions, signers) {
   const { blockhash } = await connection.getLatestBlockhash("confirmed");
-  const tx = new Transaction().add(...instructions);
+  // Large programs need the full budget: hashing costs ~0.5 CU per ELF byte.
+  const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...instructions);
   tx.recentBlockhash = blockhash;
   tx.feePayer = signers[0].publicKey;
   tx.sign(...signers);
@@ -70,9 +94,9 @@ async function main() {
   const wallet = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(WALLET_PATH))));
   console.log(`cluster: ${RPC_URL}`);
   console.log(`wallet:  ${wallet.publicKey.toBase58()}`);
-  if ((await connection.getBalance(wallet.publicKey)) < 0.05 * LAMPORTS_PER_SOL) {
-    if (!IS_LOCAL) throw new Error("wallet needs funds");
-    const sig = await connection.requestAirdrop(wallet.publicKey, 5 * LAMPORTS_PER_SOL);
+  if ((await connection.getBalance(wallet.publicKey)) < 3 * LAMPORTS_PER_SOL) {
+    if (!IS_LOCAL) throw new Error("wallet needs ~3 SOL (one throwaway deploy, refunded on close)");
+    const sig = await connection.requestAirdrop(wallet.publicKey, 10 * LAMPORTS_PER_SOL);
     await connection.confirmTransaction(sig, "confirmed");
   }
 
@@ -94,8 +118,14 @@ async function main() {
     const local = sha256(trim(fs.readFileSync(SO_PATH)));
     console.log(`  local .so hash: ${local} ${local === programHash ? "(matches deployed)" : "(differs from deployed!)"}`);
   }
-  const squadsInfo = await connection.getAccountInfo(SQUADS_V4);
-  const squadsProgramData = squadsInfo ? new PublicKey(squadsInfo.data.subarray(4, 36)) : null;
+  // Squads v4: a large, heavily zero-padded ProgramData (the CU worst case for trimming).
+  const squads = await chainProgramHash(connection, SQUADS_V4);
+  if (squads) {
+    console.log(`  squads v4: ${squads.elfLen} ELF bytes, ${squads.elfLen - squads.trimmedLen} trailing zeros, hash ${squads.hash}`);
+  }
+  step("deploying + closing a throwaway program (for the closed-ProgramData case)");
+  const closedProgram = deployAndCloseProgram();
+  if (closedProgram) ok(`closed program: ${closedProgram.toBase58()}`);
 
   const accountHashIx = (args, account = args.account) => program.methods
     .assertAccountHash(args).accounts({ account }).instruction();
@@ -121,9 +151,25 @@ async function main() {
     { label: "program revision, args/program mismatch", expect: "ProgramKeyMismatch", ix: () => revisionIx({ program: programId, expectedHash: programHash }, { program: SQUADS_V4 }) },
     { label: "program revision, programdata passed as program", expect: "NotAProgram", ix: () => revisionIx({ program: programData, expectedHash: programHash }) },
     { label: "program revision, non-loader program account", expect: "InvalidProgramOwner", ix: () => revisionIx({ program: wallet.publicKey, expectedHash: programHash }) },
-    ...(squadsProgramData ? [{
-      label: "program revision, another program's programdata", expect: "ProgramDataAddressMismatch",
-      ix: () => revisionIx({ program: programId, expectedHash: programHash }, { programData: squadsProgramData }),
+    ...(squads ? [
+      {
+        label: "program revision, Squads v4 (large, zero-padded ProgramData)",
+        ix: () => revisionIx({ program: SQUADS_V4, expectedHash: squads.hash }, { programData: squads.programData }),
+      },
+      {
+        label: "program revision, another program's programdata", expect: "ProgramDataAddressMismatch",
+        ix: () => revisionIx({ program: programId, expectedHash: programHash }, { programData: squads.programData }),
+      },
+    ] : []),
+    ...(closedProgram ? [{
+      label: "program revision, closed program", expect: "InvalidProgramDataOwner",
+      ix: async () => {
+        const info = await connection.getAccountInfo(closedProgram);
+        return revisionIx(
+          { program: closedProgram, expectedHash: programHash },
+          { program: closedProgram, programData: new PublicKey(info.data.subarray(4, 36)) },
+        );
+      },
     }] : []),
   ];
 

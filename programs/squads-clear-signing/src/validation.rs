@@ -41,7 +41,7 @@ const PROGRAMDATA_STATE_TAG: u32 = 3;
 
 /// Serialized size of `UpgradeableLoaderState::Program`: 4-byte enum tag +
 /// 32-byte `programdata_address`.
-pub const PROGRAM_ACCOUNT_SIZE: usize = 36;
+const PROGRAM_ACCOUNT_SIZE: usize = 36;
 
 /// Serialized size of `UpgradeableLoaderState::ProgramData` metadata: 4-byte
 /// enum tag + 8-byte slot + `Option<Pubkey>` upgrade authority (1 + 32, always
@@ -237,16 +237,38 @@ pub fn validate_instructions(
     Ok(())
 }
 
+/// Chunk size for the zero-tail scan in `trim_trailing_zeros`.
+const ZERO_CHUNK: usize = 4096;
+static ZEROS: [u8; ZERO_CHUNK] = [0; ZERO_CHUNK];
+
 /// Returns `bytes` with every contiguous `0x00` byte at the end removed —
 /// the normalization `solana-verify` applies before hashing program bytes
 /// (deploy-time zero padding must not change the hash).
+///
+/// ProgramData accounts are often over-allocated by hundreds of KB to MBs, so
+/// a byte-wise scan (~6 CU/byte in SBF) would exhaust the compute budget on
+/// real programs. Whole zero chunks are skipped with the `sol_memcmp` syscall
+/// (~ZERO_CHUNK/250 CU each); only the final partial chunk is scanned
+/// byte-wise.
 pub fn trim_trailing_zeros(bytes: &[u8]) -> &[u8] {
-    let end = bytes
+    let mut end = bytes.len();
+    while end >= ZERO_CHUNK && is_zero_chunk(&bytes[end - ZERO_CHUNK..end]) {
+        end -= ZERO_CHUNK;
+    }
+    let end = bytes[..end]
         .iter()
         .rposition(|&b| b != 0)
         .map(|i| i + 1)
         .unwrap_or(0);
     &bytes[..end]
+}
+
+fn is_zero_chunk(chunk: &[u8]) -> bool {
+    debug_assert_eq!(chunk.len(), ZERO_CHUNK);
+    // SAFETY: both slices are exactly ZERO_CHUNK bytes long.
+    unsafe {
+        anchor_lang::solana_program::program_memory::sol_memcmp(chunk, &ZEROS, ZERO_CHUNK) == 0
+    }
 }
 
 /// Extract the program (ELF) bytes from a BPF upgradeable loader Buffer
@@ -263,9 +285,12 @@ pub fn extract_buffer_program_bytes(data: &[u8]) -> Result<&[u8]> {
 
 /// SHA-256 (via the native `sol_sha256` syscall) of the program bytes with
 /// trailing zeros trimmed — byte-identical to `solana-verify get-buffer-hash`
-/// (32-byte digest). Off-chain equivalent: `sha256(trim_trailing_zeros(elf))`.
-pub fn compute_program_hash(program_bytes: &[u8]) -> [u8; 32] {
-    solana_sha256_hasher::hash(trim_trailing_zeros(program_bytes)).to_bytes()
+/// / `get-program-hash` (32-byte digest). Off-chain equivalent:
+/// `sha256(trim_trailing_zeros(elf))`. Returns the digest and the trimmed
+/// length (for logging, without trimming twice).
+pub fn compute_program_hash(program_bytes: &[u8]) -> ([u8; 32], usize) {
+    let trimmed = trim_trailing_zeros(program_bytes);
+    (solana_sha256_hasher::hash(trimmed).to_bytes(), trimmed.len())
 }
 
 /// Decode one lowercase-hex nibble.
@@ -294,7 +319,7 @@ pub fn parse_hex_hash(s: &str) -> Option<[u8; 32]> {
 /// `parse_hex_hash` for `verify_buffer_hash`, which has always reported a
 /// malformed digest as `BufferHashMismatch` (kept for error-code stability).
 pub fn hex_to_hash(s: &str) -> Result<[u8; 32]> {
-    parse_hex_hash(s).ok_or(error!(ClearSigningError::BufferHashMismatch))
+    parse_hex_hash(s).ok_or_else(|| error!(ClearSigningError::BufferHashMismatch))
 }
 
 /// Compare a computed digest against the signer-displayed hex digest. A
@@ -307,7 +332,7 @@ pub fn check_hash(
     mismatch: ClearSigningError,
 ) -> Result<()> {
     let expected =
-        parse_hex_hash(expected_hex).ok_or(error!(ClearSigningError::InvalidHashFormat))?;
+        parse_hex_hash(expected_hex).ok_or_else(|| error!(ClearSigningError::InvalidHashFormat))?;
     if *computed != expected {
         msg!("{} hash mismatch", label);
         msg!("  computed: {}", hash_to_hex(computed));
@@ -321,7 +346,7 @@ pub fn check_hash(
 /// data — the generic commitment checked by `assert_account_hash`. Off-chain
 /// equivalent: `sha256(account.data)`. Unlike program hashes, no trailing-zero
 /// trimming is applied: for arbitrary account state, trailing zeros are
-/// meaningful (e.g. a zero balance field at the end of a struct).
+/// meaningful (e.g. a zero-valued integer field at the end of a struct).
 pub fn compute_account_hash(data: &[u8]) -> [u8; 32] {
     solana_sha256_hasher::hash(data).to_bytes()
 }
@@ -652,6 +677,37 @@ mod tests {
         assert_eq!(trim_trailing_zeros(&[]), &[] as &[u8]);
     }
 
+    /// The chunked scan must agree with a plain byte-wise trim at every
+    /// alignment of the last non-zero byte relative to the chunk boundaries.
+    #[test]
+    fn chunked_trim_matches_bytewise() {
+        fn reference(b: &[u8]) -> usize {
+            b.iter().rposition(|&x| x != 0).map(|i| i + 1).unwrap_or(0)
+        }
+        for total in [0, 1, ZERO_CHUNK - 1, ZERO_CHUNK, ZERO_CHUNK + 1, 3 * ZERO_CHUNK + 7] {
+            let mut positions = vec![None];
+            for p in [0, 1, ZERO_CHUNK - 1, ZERO_CHUNK, ZERO_CHUNK + 1, 2 * ZERO_CHUNK + 3] {
+                if p < total {
+                    positions.push(Some(p));
+                }
+            }
+            if total > 0 {
+                positions.push(Some(total - 1));
+            }
+            for pos in positions {
+                let mut data = vec![0u8; total];
+                if let Some(p) = pos {
+                    data[p] = 0x5a;
+                }
+                assert_eq!(
+                    trim_trailing_zeros(&data).len(),
+                    reference(&data),
+                    "total {total}, nonzero at {pos:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn sha256_matches_reference_and_solana_verify_convention() {
         use sha2::{Digest, Sha256};
@@ -662,17 +718,17 @@ mod tests {
             &[7u8; 5000],
         ] {
             let expected: [u8; 32] = Sha256::digest(trim_trailing_zeros(input)).into();
-            assert_eq!(compute_program_hash(input), expected);
+            assert_eq!(compute_program_hash(input).0, expected);
         }
         // sha256("abc") = ba7816bf... — the solana-verify hashing convention.
         assert_eq!(
-            hash_to_hex(&compute_program_hash(b"abc")),
+            hash_to_hex(&compute_program_hash(b"abc").0),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         // Trailing zeros must not affect the hash.
         assert_eq!(
             compute_program_hash(b"abc\x00\x00\x00"),
-            compute_program_hash(b"abc")
+            (compute_program_hash(b"abc").0, 3)
         );
     }
 
@@ -683,8 +739,8 @@ mod tests {
         let hex = hash_to_hex(&digest);
         assert_eq!(hex.len(), 64);
         assert_eq!(hex_to_hash(&hex).unwrap(), digest);
-        assert_eq!(hash_to_hex(&compute_program_hash(b"abc\x00\x00")),
-                   hash_to_hex(&compute_program_hash(b"abc")));
+        assert_eq!(hash_to_hex(&compute_program_hash(b"abc\x00\x00").0),
+                   hash_to_hex(&compute_program_hash(b"abc").0));
     }
 
     #[test]
@@ -794,7 +850,7 @@ mod tests {
         // Program hash uses the solana-verify trimming convention.
         assert_eq!(
             compute_program_hash(extract_programdata_program_bytes(&data).unwrap()),
-            compute_program_hash(b"elf-bytes")
+            (compute_program_hash(b"elf-bytes").0, 9)
         );
 
         // A Buffer is not a ProgramData.

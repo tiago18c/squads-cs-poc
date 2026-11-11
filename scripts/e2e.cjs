@@ -8,7 +8,7 @@
  *   3. create + activate the proposal
  *   4. TAMPERED approval:  [verify_proposal(wrong lamports), proposal_approve] -> must FAIL on-chain
  *  4b. SUBSTITUTION:       honest #N shown, vote cast on a decoy #N+1 (two variants) -> must FAIL
- *   5. HONEST approval:    [assert_program_revision, assert_account_hash(vault tx),
+ *   5. HONEST approval:    [assert_account_hash(multisig), assert_program_revision,
  *                           verify_proposal(chain truth), proposal_approve] -> must succeed
  *   6. execute the vault transaction and confirm the transfer landed
  *
@@ -27,6 +27,7 @@ const {
 } = require("@solana/web3.js");
 const multisig = require("@sqds/multisig");
 const anchor = require("@anchor-lang/core");
+const { trim, sha256Hex, PROGRAMDATA_METADATA_SIZE } = require("./program-hash.cjs");
 
 const ROOT = path.join(__dirname, "..");
 const RPC_URL = process.env.RPC_URL || "http://127.0.0.1:8899";
@@ -327,24 +328,26 @@ async function main() {
   // --- 5. HONEST approval must succeed --------------------------------------
   if (proposal.approved.length === 0) {
     step("attempt 2: HONEST expected data (matches chain) + account/program assertions — must succeed");
-    // Also pin the raw VaultTransaction account (owned by Squads) and this
-    // program's own revision: the shape check must tolerate both alongside the vote.
-    const sha256 = (b) => require("crypto").createHash("sha256").update(b).digest("hex");
-    const trimZeros = (b) => { let e = b.length; while (e > 0 && b[e - 1] === 0) e--; return b.subarray(0, e); };
-    const txInfo = await withRetry(() => connection.getAccountInfo(transactionPda), "getAccountInfo");
+    // Also pin the multisig account (members / threshold at vote time, owned
+    // by Squads) and this program's own revision: the shape check must
+    // tolerate both alongside the vote.
+    const msInfo = await withRetry(() => connection.getAccountInfo(multisigPda), "getAccountInfo");
     const progInfo = await withRetry(() => connection.getAccountInfo(programId), "getAccountInfo");
     const programDataPda = new PublicKey(progInfo.data.subarray(4, 36));
     const pdInfo = await withRetry(() => connection.getAccountInfo(programDataPda), "getAccountInfo");
-    const assertTxIx = await program.methods
-      .assertAccountHash({ account: transactionPda, owner: multisig.PROGRAM_ID, expectedHash: sha256(txInfo.data) })
-      .accounts({ account: transactionPda })
+    const assertMultisigIx = await program.methods
+      .assertAccountHash({ account: multisigPda, owner: multisig.PROGRAM_ID, expectedHash: sha256Hex(msInfo.data) })
+      .accounts({ account: multisigPda })
       .instruction();
     const assertRevisionIx = await program.methods
-      .assertProgramRevision({ program: programId, expectedHash: sha256(trimZeros(pdInfo.data.subarray(45))) })
+      .assertProgramRevision({
+        program: programId,
+        expectedHash: sha256Hex(trim(pdInfo.data.subarray(PROGRAMDATA_METADATA_SIZE))),
+      })
       .accounts({ program: programId, programData: programDataPda })
       .instruction();
     const good = await sendTx(
-      connection, [assertRevisionIx, assertTxIx, await makeVerifyIx(expected), approveIx], [wallet],
+      connection, [assertMultisigIx, assertRevisionIx, await makeVerifyIx(expected), approveIx], [wallet],
     );
     if (good.err) throw new Error(`honest approval failed: ${JSON.stringify(good.err)}`);
     proposal = await fetchProposal();

@@ -200,7 +200,7 @@ pub mod squads_clear_signing {
         );
         let data = buffer.try_borrow_data()?;
         let program_bytes = validation::extract_buffer_program_bytes(&data)?;
-        let hash = validation::compute_program_hash(program_bytes);
+        let (hash, trimmed_len) = validation::compute_program_hash(program_bytes);
         // `expected_hash` is a lowercase hex string (64 chars) so an offline
         // device renders the human-readable digest — the exact value a reviewer
         // compares against `solana-verify get-buffer-hash`.
@@ -214,7 +214,7 @@ pub mod squads_clear_signing {
         msg!(
             "buffer hash OK: {} ({} program bytes, trailing zeros trimmed)",
             buffer.key(),
-            validation::trim_trailing_zeros(program_bytes).len(),
+            trimmed_len,
         );
         Ok(())
     }
@@ -223,8 +223,10 @@ pub mod squads_clear_signing {
     /// `args.expected_hash` (SHA-256 over the **untrimmed** account data, as
     /// lowercase hex), and — when `args.owner` is `Some` — that the account is
     /// owned by that program. Lets an offline signer pin the exact state of
-    /// any account a proposal depends on (a config, a mint, an oracle, ...).
-    /// Aborts the transaction on any mismatch.
+    /// any account a proposal depends on (a config, a mint, an oracle, ...)
+    /// **at vote time**. Only data and (optionally) owner are covered — not
+    /// lamports or the executable flag; a non-existent account has empty data
+    /// and the system program as owner. Aborts the transaction on any mismatch.
     pub fn assert_account_hash(
         ctx: Context<AssertAccountHash>,
         args: AssertAccountHashArgs,
@@ -271,6 +273,8 @@ pub mod squads_clear_signing {
     ///
     /// The ProgramData metadata (deploy slot, upgrade authority) is not part
     /// of the hash, so the digest identifies the build, not the deployment.
+    /// Like every assertion here it holds at vote time only: a program with
+    /// a live upgrade authority can change before the proposal executes.
     pub fn assert_program_revision(
         ctx: Context<AssertProgramRevision>,
         args: AssertProgramRevisionArgs,
@@ -305,7 +309,7 @@ pub mod squads_clear_signing {
         // 3. The ProgramData's program bytes hash.
         let data = program_data.try_borrow_data()?;
         let program_bytes = validation::extract_programdata_program_bytes(&data)?;
-        let hash = validation::compute_program_hash(program_bytes);
+        let (hash, trimmed_len) = validation::compute_program_hash(program_bytes);
         validation::check_hash(
             "program",
             &hash,
@@ -316,7 +320,7 @@ pub mod squads_clear_signing {
             "program revision OK: {} (programdata {}, {} program bytes, trailing zeros trimmed)",
             program.key(),
             program_data.key(),
-            validation::trim_trailing_zeros(program_bytes).len(),
+            trimmed_len,
         );
         Ok(())
     }

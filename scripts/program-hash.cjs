@@ -56,4 +56,10 @@ async function main() {
   console.log(digest(algo, pd.data.subarray(PROGRAMDATA_METADATA_SIZE)));
 }
 
-main().catch((e) => { console.error(String(e.message || e)); process.exit(1); });
+const sha256Hex = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
+
+module.exports = { trim, sha256Hex, PROGRAMDATA_METADATA_SIZE, BUFFER_METADATA_SIZE };
+
+if (require.main === module) {
+  main().catch((e) => { console.error(String(e.message || e)); process.exit(1); });
+}

@@ -102,8 +102,10 @@
         "`args.expected_hash` (SHA-256 over the **untrimmed** account data, as",
         "lowercase hex), and \u2014 when `args.owner` is `Some` \u2014 that the account is",
         "owned by that program. Lets an offline signer pin the exact state of",
-        "any account a proposal depends on (a config, a mint, an oracle, ...).",
-        "Aborts the transaction on any mismatch."
+        "any account a proposal depends on (a config, a mint, an oracle, ...)",
+        "**at vote time**. Only data and (optionally) owner are covered \u2014 not",
+        "lamports or the executable flag; a non-existent account has empty data",
+        "and the system program as owner. Aborts the transaction on any mismatch."
       ],
       "discriminator": [
         49,
@@ -152,7 +154,9 @@
         "`solana-verify get-program-hash <program>`.",
         "",
         "The ProgramData metadata (deploy slot, upgrade authority) is not part",
-        "of the hash, so the digest identifies the build, not the deployment."
+        "of the hash, so the digest identifies the build, not the deployment.",
+        "Like every assertion here it holds at vote time only: a program with",
+        "a live upgrade authority can change before the proposal executes."
       ],
       "discriminator": [
         138,
