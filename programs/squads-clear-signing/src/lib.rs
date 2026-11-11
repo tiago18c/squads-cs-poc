@@ -34,6 +34,8 @@
 //! actually saw.
 
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::instruction::{get_stack_height, TRANSACTION_LEVEL_STACK_HEIGHT};
+use anchor_lang::Discriminator;
 use solana_instructions_sysvar as sysvar_instructions;
 
 pub mod errors;
@@ -53,90 +55,13 @@ pub mod squads_clear_signing {
     /// `args.instructions` exactly, and that this transaction contains the
     /// matching Squads vote instruction (and nothing else). Aborts otherwise.
     pub fn verify_proposal(ctx: Context<VerifyProposal>, args: VerifyProposalArgs) -> Result<()> {
-        // 1. The proposal under vote. Squads only creates a `Proposal` at the
-        //    PDA `(multisig, transaction_index)` and records those two values in
-        //    it, so a Squads-owned account with the Proposal discriminator tells
-        //    us authoritatively which transaction it belongs to — no PDA
-        //    derivation needed. Step 5 requires the sibling vote to target
-        //    exactly this account.
-        let proposal_key = ctx.accounts.proposal.key();
-        require_keys_eq!(
-            *ctx.accounts.proposal.owner,
-            squads::SQUADS_PROGRAM_ID,
-            ClearSigningError::InvalidProposalOwner
-        );
-        let proposal = {
-            let data = ctx.accounts.proposal.try_borrow_data()?;
-            squads::ProposalHeader::parse_checked(&data)?
-        };
-        require_keys_eq!(
-            proposal.multisig,
-            args.multisig,
-            ClearSigningError::ProposalMultisigMismatch
-        );
-        require_eq!(
-            proposal.transaction_index,
-            args.transaction_index,
-            ClearSigningError::ProposalIndexMismatch
-        );
-
-        // 2. The vault transaction. Same argument: Squads only creates it at the
-        //    PDA `(multisig, index)`, so ownership + discriminator + matching
-        //    stored `(multisig, index)` identify the proposal's transaction.
-        //    The discriminator check also guarantees this is a VaultTransaction,
-        //    not a ConfigTransaction or Batch sharing the index.
-        require_keys_eq!(
-            *ctx.accounts.transaction.owner,
-            squads::SQUADS_PROGRAM_ID,
-            ClearSigningError::InvalidTransactionOwner
-        );
-        let vault_tx = {
-            let data = ctx.accounts.transaction.try_borrow_data()?;
-            squads::VaultTransaction::deserialize_checked(&data)?
-        };
-        require_keys_eq!(vault_tx.multisig, proposal.multisig, ClearSigningError::MultisigMismatch);
-        require_eq!(
-            vault_tx.index,
-            proposal.transaction_index,
-            ClearSigningError::TransactionIndexMismatch
-        );
-        require_eq!(
-            vault_tx.vault_index,
-            args.vault_index,
-            ClearSigningError::VaultIndexMismatch
-        );
-        require_eq!(
-            vault_tx.ephemeral_signer_bumps.len(),
-            usize::from(args.num_ephemeral_signers),
-            ClearSigningError::EphemeralSignersMismatch
-        );
-
-        // 3. Resolve the full account key table. Any address lookup tables the
-        //    message references must be passed as remaining accounts, in order.
-        let lookups = &vault_tx.message.address_table_lookups;
-        require!(
-            ctx.remaining_accounts.len() == lookups.len(),
-            ClearSigningError::LookupTableCountMismatch
-        );
-        let mut tables: Vec<Vec<Pubkey>> = Vec::with_capacity(lookups.len());
-        for (account, lookup) in ctx.remaining_accounts.iter().zip(lookups.iter()) {
-            require_keys_eq!(
-                account.key(),
-                lookup.account_key,
-                ClearSigningError::LookupTableAddressMismatch
-            );
-            require_keys_eq!(
-                *account.owner,
-                validation::ADDRESS_LOOKUP_TABLE_PROGRAM_ID,
-                ClearSigningError::InvalidLookupTableOwner
-            );
-            let data = account.try_borrow_data()?;
-            tables.push(validation::parse_lookup_table_addresses(&data)?);
-        }
-        let keys = AccountKeys::resolve(&vault_tx.message, &tables)?;
-
-        // 4. Diff the stored message against what the offline signer saw.
-        validation::validate_instructions(&vault_tx.message, &keys, &args.instructions)?;
+        // 1-4. Bind proposal <-> transaction and diff the stored content.
+        let (proposal_key, vault_instructions) = verify_content(
+            ctx.accounts.proposal.as_ref(),
+            ctx.accounts.transaction.as_ref(),
+            ctx.remaining_accounts,
+            &args,
+        )?;
 
         // 5. Enforce the shape of this (outer) transaction via the sysvar:
         //    nothing but us, compute budget, and the expected vote.
@@ -169,8 +94,94 @@ pub mod squads_clear_signing {
             proposal_key,
             args.multisig,
             args.transaction_index,
-            vault_tx.message.instructions.len(),
+            vault_instructions,
             args.member,
+        );
+        Ok(())
+    }
+
+    /// `verify_proposal` for a **programmatic signer**: a member key that is a
+    /// PDA and can only sign inside a CPI (ed25519 programmatic signer,
+    /// Vector, ...). Must itself be invoked via CPI, with the member signing.
+    ///
+    /// The content checks are identical to `verify_proposal`. The difference
+    /// is where the Squads vote is looked for: not among the top-level
+    /// instructions, but in the instruction list serialized inside the data
+    /// of the current top-level instruction (the one driving the signer
+    /// program), at the place `location` gives. That list must run to the end
+    /// of the instruction data, contain this very invocation, and otherwise
+    /// consist only of this program's instructions and the expected vote.
+    pub fn verify_proposal_cpi(
+        ctx: Context<VerifyProposalCpi>,
+        args: VerifyProposalArgs,
+        location: VoteLocation,
+    ) -> Result<()> {
+        require!(
+            get_stack_height() > TRANSACTION_LEVEL_STACK_HEIGHT,
+            ClearSigningError::NotInvokedViaCpi
+        );
+        require_keys_eq!(
+            ctx.accounts.member.key(),
+            args.member,
+            ClearSigningError::MemberAccountMismatch
+        );
+
+        let (proposal_key, num_instructions) = verify_content(
+            ctx.accounts.proposal.as_ref(),
+            ctx.accounts.transaction.as_ref(),
+            ctx.remaining_accounts,
+            &args,
+        )?;
+
+        // The top-level instruction this CPI descends from.
+        let sysvar_info = ctx.accounts.instructions_sysvar.to_account_info();
+        let current = sysvar_instructions::load_current_index_checked(&sysvar_info)
+            .map_err(|_| error!(ClearSigningError::InstructionsSysvarError))?;
+        let enclosing =
+            sysvar_instructions::load_instruction_at_checked(usize::from(current), &sysvar_info)
+                .map_err(|_| error!(ClearSigningError::InstructionsSysvarError))?;
+
+        // This invocation's own instruction data, to find it in the list.
+        let mut own_data = instruction::VerifyProposalCpi::DISCRIMINATOR.to_vec();
+        args.serialize(&mut own_data)?;
+        location.serialize(&mut own_data)?;
+
+        let expectation = VoteExpectation {
+            self_program: crate::ID,
+            multisig: args.multisig,
+            proposal: proposal_key,
+            member: args.member,
+            action: args.action,
+        };
+        match location {
+            VoteLocation::V1Message { offset } => validation::validate_embedded_v1_message(
+                &enclosing.data,
+                usize::from(offset),
+                &own_data,
+                &expectation,
+            )?,
+            VoteLocation::Passthrough {
+                offset,
+                first_account,
+            } => validation::validate_embedded_passthrough(
+                &enclosing.data,
+                &enclosing.accounts,
+                usize::from(offset),
+                usize::from(first_account),
+                &own_data,
+                &expectation,
+            )?,
+        }
+
+        msg!(
+            "clear-signing OK (cpi): {:?} on proposal {} (multisig {}, tx index {}, {} instructions) by member {} via {}",
+            args.action,
+            proposal_key,
+            args.multisig,
+            args.transaction_index,
+            num_instructions,
+            args.member,
+            enclosing.program_id,
         );
         Ok(())
     }
@@ -324,6 +335,143 @@ pub mod squads_clear_signing {
         );
         Ok(())
     }
+}
+
+/// The content checks shared by `verify_proposal` and `verify_proposal_cpi`:
+/// bind the proposal to its vault transaction and diff the stored message
+/// against `args.instructions`. Returns the proposal key and the number of
+/// instructions in the vault transaction.
+fn verify_content(
+    proposal: &AccountInfo,
+    transaction: &AccountInfo,
+    lookup_tables: &[AccountInfo],
+    args: &VerifyProposalArgs,
+) -> Result<(Pubkey, usize)> {
+    // 1. The proposal under vote. Squads only creates a `Proposal` at the
+    //    PDA `(multisig, transaction_index)` and records those two values in
+    //    it, so a Squads-owned account with the Proposal discriminator tells
+    //    us authoritatively which transaction it belongs to — no PDA
+    //    derivation needed. Step 5 requires the sibling vote to target
+    //    exactly this account.
+    let proposal_key = proposal.key();
+    require_keys_eq!(
+        *proposal.owner,
+        squads::SQUADS_PROGRAM_ID,
+        ClearSigningError::InvalidProposalOwner
+    );
+    let proposal = {
+        let data = proposal.try_borrow_data()?;
+        squads::ProposalHeader::parse_checked(&data)?
+    };
+    require_keys_eq!(
+        proposal.multisig,
+        args.multisig,
+        ClearSigningError::ProposalMultisigMismatch
+    );
+    require_eq!(
+        proposal.transaction_index,
+        args.transaction_index,
+        ClearSigningError::ProposalIndexMismatch
+    );
+
+    // 2. The vault transaction. Same argument: Squads only creates it at the
+    //    PDA `(multisig, index)`, so ownership + discriminator + matching
+    //    stored `(multisig, index)` identify the proposal's transaction.
+    //    The discriminator check also guarantees this is a VaultTransaction,
+    //    not a ConfigTransaction or Batch sharing the index.
+    require_keys_eq!(
+        *transaction.owner,
+        squads::SQUADS_PROGRAM_ID,
+        ClearSigningError::InvalidTransactionOwner
+    );
+    let vault_tx = {
+        let data = transaction.try_borrow_data()?;
+        squads::VaultTransaction::deserialize_checked(&data)?
+    };
+    require_keys_eq!(vault_tx.multisig, proposal.multisig, ClearSigningError::MultisigMismatch);
+    require_eq!(
+        vault_tx.index,
+        proposal.transaction_index,
+        ClearSigningError::TransactionIndexMismatch
+    );
+    require_eq!(
+        vault_tx.vault_index,
+        args.vault_index,
+        ClearSigningError::VaultIndexMismatch
+    );
+    require_eq!(
+        vault_tx.ephemeral_signer_bumps.len(),
+        usize::from(args.num_ephemeral_signers),
+        ClearSigningError::EphemeralSignersMismatch
+    );
+
+    // 3. Resolve the full account key table. Any address lookup tables the
+    //    message references must be passed as remaining accounts, in order.
+    let lookups = &vault_tx.message.address_table_lookups;
+    require!(
+        lookup_tables.len() == lookups.len(),
+        ClearSigningError::LookupTableCountMismatch
+    );
+    let mut tables: Vec<Vec<Pubkey>> = Vec::with_capacity(lookups.len());
+    for (account, lookup) in lookup_tables.iter().zip(lookups.iter()) {
+        require_keys_eq!(
+            account.key(),
+            lookup.account_key,
+            ClearSigningError::LookupTableAddressMismatch
+        );
+        require_keys_eq!(
+            *account.owner,
+            validation::ADDRESS_LOOKUP_TABLE_PROGRAM_ID,
+            ClearSigningError::InvalidLookupTableOwner
+        );
+        let data = account.try_borrow_data()?;
+        tables.push(validation::parse_lookup_table_addresses(&data)?);
+    }
+    let keys = AccountKeys::resolve(&vault_tx.message, &tables)?;
+
+    // 4. Diff the stored message against what the offline signer saw.
+    validation::validate_instructions(&vault_tx.message, &keys, &args.instructions)?;
+
+    Ok((proposal_key, vault_tx.message.instructions.len()))
+}
+
+#[derive(Accounts)]
+pub struct VerifyProposalCpi<'info> {
+    /// The Squads v4 `Proposal` being voted on.
+    /// CHECK: validated in the handler exactly as in `verify_proposal`.
+    pub proposal: UncheckedAccount<'info>,
+
+    /// The Squads v4 `VaultTransaction` the proposal belongs to.
+    /// CHECK: validated in the handler exactly as in `verify_proposal`.
+    pub transaction: UncheckedAccount<'info>,
+
+    /// CHECK: constrained to the instructions sysvar address.
+    #[account(address = sysvar_instructions::ID @ ClearSigningError::InstructionsSysvarError)]
+    pub instructions_sysvar: UncheckedAccount<'info>,
+
+    /// The multisig member casting the vote: the programmatic signer, which
+    /// must sign this CPI (and equal `args.member`).
+    pub member: Signer<'info>,
+    //
+    // remaining_accounts: address lookup tables, as in `verify_proposal`.
+}
+
+/// Where `verify_proposal_cpi` finds the instruction list that carries the
+/// Squads vote, inside the data of the current top-level instruction.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoteLocation {
+    /// A serialized Solana v1 message starts at byte `offset` (its `0x81`
+    /// version byte) and runs to the end of the data. Program ids and
+    /// accounts are indexes into the message's own address table. This is
+    /// what the ed25519 programmatic signer's executor runs.
+    V1Message { offset: u16 },
+    /// A passthrough list starts at byte `offset` (its instruction count) and
+    /// runs to the end of the data: `count`, then per instruction
+    /// `{ num_accounts: u8, data_len: u16, data }`. Program ids and accounts
+    /// are the top-level instruction's own accounts, from index
+    /// `first_account` to the end: per instruction, the program, then its
+    /// accounts. This is Vector's `Passthrough` (`offset` 1, `first_account` 2).
+    Passthrough { offset: u16, first_account: u8 },
 }
 
 #[derive(Accounts)]

@@ -101,4 +101,15 @@ pub enum ClearSigningError {
     NotAProgramData,
     #[msg("Program bytes do not hash to the expected value")]
     ProgramHashMismatch,
+    // --- verify_proposal_cpi (6048+) ---
+    #[msg("verify_proposal_cpi must be invoked via CPI, not as a top-level instruction")]
+    NotInvokedViaCpi,
+    #[msg("Member account does not match the member in the args")]
+    MemberAccountMismatch,
+    #[msg("Embedded instructions at the given offset are malformed or out of bounds")]
+    MalformedEmbeddedInstructions,
+    #[msg("Embedded instructions do not end exactly at the end of the enclosing instruction")]
+    EmbeddedTrailingBytes,
+    #[msg("Embedded instructions do not contain this verify_proposal_cpi instruction")]
+    EmbeddedSelfInstructionMissing,
 }

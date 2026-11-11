@@ -406,48 +406,238 @@ pub fn validate_transaction_shape(
     top_level: &[Instruction],
     expectation: &VoteExpectation,
 ) -> Result<()> {
-    let vote_discriminator = expectation.action.discriminator();
     let mut votes: usize = 0;
-
     for (i, ix) in top_level.iter().enumerate() {
-        if ix.program_id == expectation.self_program
-            || ix.program_id == COMPUTE_BUDGET_PROGRAM_ID
-        {
-            continue;
-        }
-        if ix.program_id == SQUADS_PROGRAM_ID {
-            if ix.data.len() < 8 || ix.data[..8] != vote_discriminator {
-                msg!("ix {}: unexpected Squads instruction (wrong discriminator)", i);
-                return err!(ClearSigningError::UnexpectedSquadsInstruction);
-            }
-            // ProposalVote accounts: 0 = multisig, 1 = member (signer), 2 = proposal.
-            if ix.accounts.len() < 3 {
-                return err!(ClearSigningError::MalformedVoteInstruction);
-            }
-            if ix.accounts[0].pubkey != expectation.multisig {
-                msg!("ix {}: vote multisig {} != expected", i, ix.accounts[0].pubkey);
-                return err!(ClearSigningError::VoteMultisigMismatch);
-            }
-            if ix.accounts[1].pubkey != expectation.member {
-                msg!("ix {}: vote member {} != expected", i, ix.accounts[1].pubkey);
-                return err!(ClearSigningError::VoteMemberMismatch);
-            }
-            if !ix.accounts[1].is_signer {
-                return err!(ClearSigningError::VoteMemberNotSigner);
-            }
-            if ix.accounts[2].pubkey != expectation.proposal {
-                msg!("ix {}: vote proposal {} != expected", i, ix.accounts[2].pubkey);
-                return err!(ClearSigningError::VoteProposalMismatch);
-            }
-            votes += 1;
-            continue;
-        }
-        msg!("ix {}: forbidden program {}", i, ix.program_id);
-        return err!(ClearSigningError::ForbiddenInstruction);
+        check_shape_instruction(
+            i,
+            &ix.program_id,
+            &ix.data,
+            |n| ix.accounts.get(n).map(|m| (m.pubkey, m.is_signer)),
+            expectation,
+            &mut votes,
+        )?;
     }
-
     require!(votes >= 1, ClearSigningError::MissingVoteInstruction);
     Ok(())
+}
+
+/// The shape rule for one instruction, shared by the top-level check and the
+/// embedded (CPI) checks: it must target this program or the compute budget
+/// program, or be exactly the expected Squads vote (counted in `votes`).
+/// `account(n)` yields the n-th account's `(pubkey, is_signer)`.
+fn check_shape_instruction(
+    i: usize,
+    program_id: &Pubkey,
+    data: &[u8],
+    account: impl Fn(usize) -> Option<(Pubkey, bool)>,
+    expectation: &VoteExpectation,
+    votes: &mut usize,
+) -> Result<()> {
+    if *program_id == expectation.self_program || *program_id == COMPUTE_BUDGET_PROGRAM_ID {
+        return Ok(());
+    }
+    if *program_id != SQUADS_PROGRAM_ID {
+        msg!("ix {}: forbidden program {}", i, program_id);
+        return err!(ClearSigningError::ForbiddenInstruction);
+    }
+    if data.len() < 8 || data[..8] != expectation.action.discriminator() {
+        msg!("ix {}: unexpected Squads instruction (wrong discriminator)", i);
+        return err!(ClearSigningError::UnexpectedSquadsInstruction);
+    }
+    // ProposalVote accounts: 0 = multisig, 1 = member (signer), 2 = proposal.
+    let (Some((multisig, _)), Some((member, member_is_signer)), Some((proposal, _))) =
+        (account(0), account(1), account(2))
+    else {
+        return err!(ClearSigningError::MalformedVoteInstruction);
+    };
+    if multisig != expectation.multisig {
+        msg!("ix {}: vote multisig {} != expected", i, multisig);
+        return err!(ClearSigningError::VoteMultisigMismatch);
+    }
+    if member != expectation.member {
+        msg!("ix {}: vote member {} != expected", i, member);
+        return err!(ClearSigningError::VoteMemberMismatch);
+    }
+    if !member_is_signer {
+        return err!(ClearSigningError::VoteMemberNotSigner);
+    }
+    if proposal != expectation.proposal {
+        msg!("ix {}: vote proposal {} != expected", i, proposal);
+        return err!(ClearSigningError::VoteProposalMismatch);
+    }
+    *votes += 1;
+    Ok(())
+}
+
+// --- embedded instructions (verify_proposal_cpi) ---------------------------
+//
+// When the member is a programmatic signer (a PDA that only signs inside a
+// CPI), the vote is not a top-level instruction: it is serialized inside the
+// data of the top-level instruction that drives the signer program. The
+// functions below parse that serialized instruction list at a caller-given
+// offset and apply the same shape rule to it.
+//
+// Three rules make the given offset hard to point at decoy bytes:
+//   * the list must run to the exact end of the enclosing instruction data
+//     (and, for passthrough, consume the account list exactly);
+//   * it must contain this very `verify_proposal_cpi` invocation, byte for
+//     byte (`own_data`), so it cannot be a fragment of our own arguments;
+//   * every instruction in it must pass the shape rule.
+
+/// Version prefix byte of a serialized Solana v1 message (SIMD-0385).
+const V1_MESSAGE_PREFIX: u8 = 0x81;
+/// Fixed part of a v1 message: prefix, 3-byte header, u32 config mask,
+/// 32-byte lifetime specifier, instruction count, address count.
+const V1_FIXED_SIZE: usize = 42;
+
+fn malformed() -> Error {
+    error!(ClearSigningError::MalformedEmbeddedInstructions)
+}
+
+fn finish_embedded(votes: usize, found_self: bool) -> Result<()> {
+    require!(found_self, ClearSigningError::EmbeddedSelfInstructionMissing);
+    require!(votes >= 1, ClearSigningError::MissingVoteInstruction);
+    Ok(())
+}
+
+/// Validate a serialized Solana **v1 message** embedded in `data` at `offset`
+/// (the format the ed25519 programmatic signer's executor runs):
+///
+/// ```text
+/// 0x81 | num_required_signatures, num_readonly_signed, num_readonly_unsigned
+///      | config mask u32 (must be 0) | lifetime [32] | num_instructions | num_addresses
+///      | addresses [32 * num_addresses]
+///      | headers   [num_instructions * { program_id_index, num_accounts, data_len u16 }]
+///      | payloads  [per instruction: account indexes, then data]
+/// ```
+///
+/// An account is a signer of an embedded instruction iff its index is below
+/// `num_required_signatures`.
+pub fn validate_embedded_v1_message(
+    data: &[u8],
+    offset: usize,
+    own_data: &[u8],
+    expectation: &VoteExpectation,
+) -> Result<()> {
+    let m = data.get(offset..).ok_or_else(malformed)?;
+    require!(
+        m.len() >= V1_FIXED_SIZE && m[0] == V1_MESSAGE_PREFIX,
+        ClearSigningError::MalformedEmbeddedInstructions
+    );
+    let num_signers = usize::from(m[1]);
+    // A non-zero config mask adds variable-size fields; no driver sets it.
+    require!(
+        m[4..8] == [0u8; 4],
+        ClearSigningError::MalformedEmbeddedInstructions
+    );
+    let num_instructions = usize::from(m[40]);
+    let num_addresses = usize::from(m[41]);
+    let headers_start = V1_FIXED_SIZE + 32 * num_addresses;
+    let addresses = m.get(V1_FIXED_SIZE..headers_start).ok_or_else(malformed)?;
+    let mut cursor = headers_start + 4 * num_instructions;
+    let headers = m.get(headers_start..cursor).ok_or_else(malformed)?;
+    let key = |index: u8| -> Option<Pubkey> {
+        let start = usize::from(index) * 32;
+        let bytes = addresses.get(start..start + 32)?;
+        Some(Pubkey::new_from_array(bytes.try_into().unwrap()))
+    };
+
+    let mut votes = 0;
+    let mut found_self = false;
+    for (i, header) in headers.chunks_exact(4).enumerate() {
+        let program_id = key(header[0]).ok_or_else(malformed)?;
+        let num_accounts = usize::from(header[1]);
+        let data_len = usize::from(u16::from_le_bytes([header[2], header[3]]));
+        let indexes = m.get(cursor..cursor + num_accounts).ok_or_else(malformed)?;
+        cursor += num_accounts;
+        let ix_data = m.get(cursor..cursor + data_len).ok_or_else(malformed)?;
+        cursor += data_len;
+        // Every referenced account must resolve, even ones the rule ignores.
+        for &index in indexes {
+            key(index).ok_or_else(malformed)?;
+        }
+        check_shape_instruction(
+            i,
+            &program_id,
+            ix_data,
+            |n| {
+                let index = *indexes.get(n)?;
+                Some((key(index)?, usize::from(index) < num_signers))
+            },
+            expectation,
+            &mut votes,
+        )?;
+        found_self |= program_id == expectation.self_program && ix_data == own_data;
+    }
+    require!(cursor == m.len(), ClearSigningError::EmbeddedTrailingBytes);
+    finish_embedded(votes, found_self)
+}
+
+/// Validate a **passthrough** instruction list embedded in `data` at `offset`
+/// (the format of Vector's `Passthrough`), where only the instruction data is
+/// serialized and the program ids and accounts are the enclosing
+/// instruction's own accounts, consumed in order from `first_account`:
+///
+/// ```text
+/// data:     count u8 | count * { num_accounts u8, data_len u16, data }
+/// accounts: per instruction: program account, then its num_accounts accounts
+/// ```
+///
+/// The enclosing instruction's signer flags describe the transaction, not the
+/// CPI: a programmatic signer is promoted only inside the CPI. The expected
+/// member is therefore treated as a signer here; the caller has already
+/// required it to sign this very invocation, and Squads enforces it on the vote.
+pub fn validate_embedded_passthrough(
+    data: &[u8],
+    outer_accounts: &[anchor_lang::solana_program::instruction::AccountMeta],
+    offset: usize,
+    first_account: usize,
+    own_data: &[u8],
+    expectation: &VoteExpectation,
+) -> Result<()> {
+    let d = data.get(offset..).ok_or_else(malformed)?;
+    let count = usize::from(*d.first().ok_or_else(malformed)?);
+    let mut cursor = 1;
+    let mut account_cursor = first_account;
+
+    let mut votes = 0;
+    let mut found_self = false;
+    for i in 0..count {
+        let header = d.get(cursor..cursor + 3).ok_or_else(malformed)?;
+        let num_accounts = usize::from(header[0]);
+        let data_len = usize::from(u16::from_le_bytes([header[1], header[2]]));
+        cursor += 3;
+        let ix_data = d.get(cursor..cursor + data_len).ok_or_else(malformed)?;
+        cursor += data_len;
+        let program_id = outer_accounts
+            .get(account_cursor)
+            .ok_or_else(malformed)?
+            .pubkey;
+        let accounts = outer_accounts
+            .get(account_cursor + 1..account_cursor + 1 + num_accounts)
+            .ok_or_else(malformed)?;
+        account_cursor += 1 + num_accounts;
+        check_shape_instruction(
+            i,
+            &program_id,
+            ix_data,
+            |n| {
+                let meta = accounts.get(n)?;
+                Some((
+                    meta.pubkey,
+                    meta.is_signer || meta.pubkey == expectation.member,
+                ))
+            },
+            expectation,
+            &mut votes,
+        )?;
+        found_self |= program_id == expectation.self_program && ix_data == own_data;
+    }
+    require!(
+        cursor == d.len() && account_cursor == outer_accounts.len(),
+        ClearSigningError::EmbeddedTrailingBytes
+    );
+    finish_embedded(votes, found_self)
 }
 
 #[cfg(test)]
@@ -985,5 +1175,226 @@ mod tests {
             code(validate_transaction_shape(&[self_ix(), ok_vote(), sneaky], &exp)),
             err_code(ClearSigningError::VoteProposalMismatch)
         );
+    }
+
+    // --- embedded (verify_proposal_cpi) tests ---
+
+    const OWN: &[u8] = b"verify-proposal-cpi-own-data";
+
+    /// (program, [(pubkey, is_signer)], data)
+    type TestIx = (Pubkey, Vec<Pubkey>, Vec<u8>);
+
+    fn embedded_self() -> TestIx {
+        (pk(100), vec![pk(102), pk(104), pk(103)], OWN.to_vec())
+    }
+    fn embedded_vote(proposal: Pubkey) -> TestIx {
+        (
+            SQUADS_PROGRAM_ID,
+            vec![pk(101), pk(103), proposal],
+            [IX_PROPOSAL_APPROVE.to_vec(), vec![0]].concat(),
+        )
+    }
+
+    /// Serialize a v1 message: `signers` first in the key table.
+    fn v1_message(signers: &[Pubkey], ixs: &[TestIx]) -> Vec<u8> {
+        let mut keys: Vec<Pubkey> = signers.to_vec();
+        let mut index = |k: &Pubkey, keys: &mut Vec<Pubkey>| -> u8 {
+            if let Some(i) = keys.iter().position(|x| x == k) {
+                return i as u8;
+            }
+            keys.push(*k);
+            (keys.len() - 1) as u8
+        };
+        let mut headers = vec![];
+        let mut payloads = vec![];
+        for (program, accounts, data) in ixs {
+            let idxs: Vec<u8> = accounts.iter().map(|a| index(a, &mut keys)).collect();
+            headers.push(index(program, &mut keys));
+            headers.push(idxs.len() as u8);
+            headers.extend_from_slice(&(data.len() as u16).to_le_bytes());
+            payloads.extend_from_slice(&idxs);
+            payloads.extend_from_slice(data);
+        }
+        let mut m = vec![0x81, signers.len() as u8, 0, 0];
+        m.extend_from_slice(&0u32.to_le_bytes());
+        m.extend_from_slice(&[0xAB; 32]);
+        m.push(ixs.len() as u8);
+        m.push(keys.len() as u8);
+        for k in &keys {
+            m.extend_from_slice(k.as_ref());
+        }
+        m.extend_from_slice(&headers);
+        m.extend_from_slice(&payloads);
+        m
+    }
+
+    /// Wrap a message in an envelope with a 7-byte prefix; returns (data, offset).
+    fn envelope(message: &[u8]) -> (Vec<u8>, usize) {
+        ([b"prefix!".to_vec(), message.to_vec()].concat(), 7)
+    }
+
+    fn v1(signers: &[Pubkey], ixs: &[TestIx]) -> Result<()> {
+        let (data, offset) = envelope(&v1_message(signers, ixs));
+        validate_embedded_v1_message(&data, offset, OWN, &expectation())
+    }
+
+    #[test]
+    fn v1_accepts_verify_plus_vote() {
+        v1(&[pk(103)], &[embedded_self(), embedded_vote(pk(102))]).unwrap();
+        // Other instructions of this program (e.g. assert_*) are fine too.
+        let assert_ix = (pk(100), vec![pk(55)], b"assert".to_vec());
+        v1(&[pk(103)], &[assert_ix, embedded_self(), embedded_vote(pk(102))]).unwrap();
+    }
+
+    #[test]
+    fn v1_rejects_bad_content() {
+        let signers = [pk(103)];
+        // Vote on another proposal.
+        assert_eq!(
+            code(v1(&signers, &[embedded_self(), embedded_vote(pk(66))])),
+            err_code(ClearSigningError::VoteProposalMismatch)
+        );
+        // No vote.
+        assert_eq!(
+            code(v1(&signers, &[embedded_self()])),
+            err_code(ClearSigningError::MissingVoteInstruction)
+        );
+        // A foreign program next to the vote.
+        let foreign = (pk(200), vec![], b"x".to_vec());
+        assert_eq!(
+            code(v1(&signers, &[embedded_self(), embedded_vote(pk(102)), foreign])),
+            err_code(ClearSigningError::ForbiddenInstruction)
+        );
+        // A second, different Squads vote.
+        assert_eq!(
+            code(v1(&signers, &[embedded_self(), embedded_vote(pk(102)), embedded_vote(pk(66))])),
+            err_code(ClearSigningError::VoteProposalMismatch)
+        );
+        // Member outside the signer region of the embedded message.
+        assert_eq!(
+            code(v1(&[pk(77)], &[embedded_self(), embedded_vote(pk(102))])),
+            err_code(ClearSigningError::VoteMemberNotSigner)
+        );
+        // This invocation is not in the list (different data => a decoy list).
+        let other_self = (pk(100), vec![], b"some-other-verify".to_vec());
+        assert_eq!(
+            code(v1(&signers, &[other_self, embedded_vote(pk(102))])),
+            err_code(ClearSigningError::EmbeddedSelfInstructionMissing)
+        );
+    }
+
+    #[test]
+    fn v1_rejects_bad_framing() {
+        let exp = expectation();
+        let message = v1_message(&[pk(103)], &[embedded_self(), embedded_vote(pk(102))]);
+        let (data, offset) = envelope(&message);
+        let check = |d: &[u8], o: usize| code(validate_embedded_v1_message(d, o, OWN, &exp));
+        let malformed = err_code(ClearSigningError::MalformedEmbeddedInstructions);
+
+        // Offset past the end, wrong offset (no 0x81 there), truncated header.
+        assert_eq!(check(&data, data.len() + 1), malformed);
+        assert_eq!(check(&data, offset + 1), malformed);
+        assert_eq!(check(&data[..offset + 20], offset), malformed);
+        // Truncated payload.
+        assert_eq!(check(&data[..data.len() - 1], offset), malformed);
+        // Trailing bytes after the message.
+        let mut trailing = data.clone();
+        trailing.push(0);
+        assert_eq!(
+            check(&trailing, offset),
+            err_code(ClearSigningError::EmbeddedTrailingBytes)
+        );
+        // Non-zero config mask.
+        let mut masked = data.clone();
+        masked[offset + 4] = 1;
+        assert_eq!(check(&masked, offset), malformed);
+        // Account index beyond the key table (last payload = vote: 3 indexes + 9 data bytes).
+        let mut oob = data.clone();
+        let n = oob.len();
+        oob[n - 10] = 250;
+        assert_eq!(check(&oob, offset), malformed);
+    }
+
+    /// Passthrough envelope: `[tag, count, entries...]`, accounts
+    /// `[signer pda, sysvar, (program, accounts...)*]`; offset 1, first account 2.
+    fn passthrough(ixs: &[TestIx]) -> (Vec<u8>, Vec<AccountMeta>) {
+        let mut data = vec![4u8, ixs.len() as u8];
+        let mut metas = vec![
+            AccountMeta::new(pk(103), false),
+            AccountMeta::new_readonly(pk(9), false),
+        ];
+        for (program, accounts, ix_data) in ixs {
+            data.push(accounts.len() as u8);
+            data.extend_from_slice(&(ix_data.len() as u16).to_le_bytes());
+            data.extend_from_slice(ix_data);
+            metas.push(AccountMeta::new_readonly(*program, false));
+            // No signer flags: the programmatic signer is promoted only in the CPI.
+            metas.extend(accounts.iter().map(|a| AccountMeta::new(*a, false)));
+        }
+        (data, metas)
+    }
+
+    fn pt(ixs: &[TestIx]) -> Result<()> {
+        let (data, metas) = passthrough(ixs);
+        validate_embedded_passthrough(&data, &metas, 1, 2, OWN, &expectation())
+    }
+
+    #[test]
+    fn passthrough_accepts_verify_plus_vote() {
+        pt(&[embedded_self(), embedded_vote(pk(102))]).unwrap();
+    }
+
+    #[test]
+    fn passthrough_rejects_bad_content_and_framing() {
+        assert_eq!(
+            code(pt(&[embedded_self(), embedded_vote(pk(66))])),
+            err_code(ClearSigningError::VoteProposalMismatch)
+        );
+        assert_eq!(
+            code(pt(&[embedded_self()])),
+            err_code(ClearSigningError::MissingVoteInstruction)
+        );
+        assert_eq!(
+            code(pt(&[embedded_vote(pk(102))])),
+            err_code(ClearSigningError::EmbeddedSelfInstructionMissing)
+        );
+        let foreign = (pk(200), vec![], b"x".to_vec());
+        assert_eq!(
+            code(pt(&[embedded_self(), foreign, embedded_vote(pk(102))])),
+            err_code(ClearSigningError::ForbiddenInstruction)
+        );
+        // A vote by someone other than the expected member.
+        let mut other_member = embedded_vote(pk(102));
+        other_member.1[1] = pk(66);
+        assert_eq!(
+            code(pt(&[embedded_self(), other_member])),
+            err_code(ClearSigningError::VoteMemberMismatch)
+        );
+
+        let exp = expectation();
+        let (data, metas) = passthrough(&[embedded_self(), embedded_vote(pk(102))]);
+        let check = |d: &[u8], m: &[AccountMeta], o: usize, a: usize| {
+            code(validate_embedded_passthrough(d, m, o, a, OWN, &exp))
+        };
+        let malformed = err_code(ClearSigningError::MalformedEmbeddedInstructions);
+        let trailing = err_code(ClearSigningError::EmbeddedTrailingBytes);
+        // Truncated data, missing accounts.
+        assert_eq!(check(&data[..data.len() - 1], &metas, 1, 2), malformed);
+        assert_eq!(check(&data, &metas[..metas.len() - 1], 1, 2), malformed);
+        assert_eq!(check(&data, &metas, data.len(), 2), malformed);
+        // Extra data bytes / extra accounts left unconsumed.
+        let mut longer = data.clone();
+        longer.push(0);
+        assert_eq!(check(&longer, &metas, 1, 2), trailing);
+        let mut more = metas.clone();
+        more.push(AccountMeta::new_readonly(pk(1), false));
+        assert_eq!(check(&data, &more, 1, 2), trailing);
+    }
+
+    #[test]
+    fn cpi_error_codes_are_appended() {
+        assert_eq!(err_code(ClearSigningError::ProgramHashMismatch), 6047);
+        assert_eq!(err_code(ClearSigningError::NotInvokedViaCpi), 6048);
+        assert_eq!(err_code(ClearSigningError::EmbeddedSelfInstructionMissing), 6052);
     }
 }
